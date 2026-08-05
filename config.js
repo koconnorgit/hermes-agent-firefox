@@ -22,7 +22,8 @@ globalThis.HERMES = {
   // Per-surface notification toggles (settings.notify). All default on.
   // `background`: keep a connection alive while all views are closed so replies
   // still alert. The others gate individual on-screen/desktop signals.
-  NOTIFY_DEFAULTS: { badge: true, dropdown: true, pill: true, system: true, background: true },
+  // `newSession`: alert when a brand-new session appears (e.g. a timer/cron run).
+  NOTIFY_DEFAULTS: { badge: true, dropdown: true, pill: true, system: true, background: true, newSession: true },
   notifyConfig(settings) { return { ...this.NOTIFY_DEFAULTS, ...(settings?.notify || {}) }; },
 
   normHost(host) { return String(host || "").replace(/\/+$/, ""); },

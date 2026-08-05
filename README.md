@@ -81,8 +81,10 @@ the background; the full text is there when the turn finishes. Reselecting the
 session reloads it complete.
 
 **No badge / notification for other sessions.** Check **Settings → Notifications**
-(toolbar badge, dropdown highlight, "response waiting" note, and desktop
-notification are each toggleable), and that Firefox/your OS allows notifications.
+(toolbar badge, dropdown highlight, "response waiting" note, desktop notification,
+and new-session alerts are each toggleable), and that Firefox/your OS allows
+notifications. **New sessions** alerts you when a brand-new session appears (e.g. a
+timer/cron run), not just replies in existing ones.
 To get alerts when the sidebar/window is **closed**, keep **"Alert while closed"**
 on — it holds a light background connection so replies still notify (turn it off
 to avoid any background network use).

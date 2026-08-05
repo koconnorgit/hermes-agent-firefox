@@ -210,6 +210,7 @@ class Gateway {
     this.liveToStored = new Map();  // liveId → storedId
     this.active = null;             // storedId currently viewed
     this.watched = new Set();       // storedIds to keep alive so closed-UI alerts fire
+    this._newSessTimer = null;      // debounce for new-session detection
   }
 
   // ── background monitoring (alerts while all views are closed) ──
@@ -228,9 +229,10 @@ class Gateway {
   }
   async keepalive() {
     if (!notifyCfg.background) { browser.alarms.clear("hermes-keepalive"); return; }
-    const { watchedSessions = [] } = await browser.storage.session.get("watchedSessions");
-    if (!watchedSessions.length) return;
+    // Hold the socket open even with nothing watched — a bare authed socket still
+    // receives global sessions.changed, which is how we spot timer/cron sessions.
     try { await this.ensureSocket(); } catch { return; }
+    const { watchedSessions = [] } = await browser.storage.session.get("watchedSessions");
     for (const sid of watchedSessions) {
       const s = this._session(sid);
       if (!s.liveId) { try { await this.openSession(sid); } catch {} }
@@ -354,7 +356,7 @@ class Gateway {
 
   // ── incoming events → per-session log ──
   _onEvent(ev) {
-    if (ev.type === "sessions.changed") { this.broadcast({ type: "sessions-changed" }); return; }
+    if (ev.type === "sessions.changed") { this.broadcast({ type: "sessions-changed" }); this._scheduleNewSessionCheck(); return; }
     const storedId = ev.session_id ? this.liveToStored.get(ev.session_id) : null;
     if (!storedId) return;
     const s = this._session(storedId);
@@ -452,6 +454,50 @@ class Gateway {
     } catch {}
   }
 
+  // ── new-session detection (e.g. a timer/cron spawns a fresh session) ──
+  // sessions.changed only signals "the list changed", so diff /api/sessions
+  // against a baseline persisted in storage.session.
+  _scheduleNewSessionCheck() {
+    clearTimeout(this._newSessTimer);
+    this._newSessTimer = setTimeout(() => this._checkNewSessions(), 1000);
+  }
+  async _checkNewSessions() {
+    if (!notifyCfg.newSession) return;
+    let list;
+    try {
+      const r = await fetch(HOST + ENDPOINTS.sessions, { credentials: "include" });
+      if (!r.ok) return;
+      list = (await r.json())?.sessions || [];
+    } catch { return; }
+
+    const stored = await browser.storage.session.get("knownSessions");
+    if (stored.knownSessions === undefined) {
+      // First sighting → baseline the existing sessions, don't alert on them.
+      const seed = list.filter((s) => (s.message_count || 0) > 0).map((s) => s.id);
+      await browser.storage.session.set({ knownSessions: seed });
+      return;
+    }
+
+    const known = new Set(stored.knownSessions);
+    const DENY = new Set(["tool", "kanban"]); // noisy internal sources (sub-agents, workers)
+    let changed = false;
+    for (const s of list) {
+      if ((s.message_count || 0) <= 0 || known.has(s.id)) continue; // only real, unseen sessions
+      known.add(s.id); changed = true;
+      if (this.sessions.has(s.id)) continue;                        // one we already track
+      if (DENY.has((s.source || "").toLowerCase())) continue;
+      this._newSessionAlert(s);
+    }
+    if (changed) await browser.storage.session.set({ knownSessions: [...known] });
+  }
+  _newSessionAlert(sess) {
+    const s = this._session(sess.id);   // minimal entry so it shows unread in badge/dropdown
+    s.unread = true;
+    this._activity(s);
+    this.updateBadge();
+    this._notify(s, `New session: ${sess.title || sess.id}`);
+  }
+
   // ── viewer actions ──
   async view(storedId) {
     const s = await this.openSession(storedId);
@@ -488,8 +534,8 @@ const gateway = new Gateway();
 // (and reconnecting after a suspend) so replies still raise alerts.
 browser.alarms.onAlarm.addListener((a) => { if (a.name === "hermes-keepalive") gateway.keepalive(); });
 (async () => {
-  const { watchedSessions = [] } = await browser.storage.session.get("watchedSessions");
-  if (watchedSessions.length) { gateway._ensureAlarm(); gateway.keepalive(); }
+  const { settings } = await browser.storage.local.get("settings");
+  if (globalThis.HERMES.notifyConfig(settings).background) { gateway._ensureAlarm(); gateway.keepalive(); }
 })();
 
 browser.runtime.onConnect.addListener((port) => {
