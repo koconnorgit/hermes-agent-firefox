@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Agent — Settings</title>
+  <style>
+    :root {
+      --background: #170d02; --panel: #1e1305; --midground: #ffac02;
+      --foreground: #ffffff; --muted: color-mix(in srgb, #fff 55%, transparent);
+      --hairline: color-mix(in srgb, #ffac02 18%, transparent);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px; background: var(--background); color: var(--foreground);
+      font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+    fieldset { border: 1px solid var(--hairline); border-radius: 12px; padding: 14px 16px; margin: 0 0 16px; max-width: 460px; }
+    legend { padding: 0 6px; color: var(--midground); font-weight: 600; }
+    .opt { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; cursor: pointer; }
+    .opt input { margin-top: 3px; accent-color: var(--midground); }
+    .opt .label { font-weight: 600; }
+    .opt .desc { color: var(--muted); font-size: 12px; }
+    .saved { color: #7ee081; font-size: 12px; height: 16px; }
+    .actions { max-width: 460px; display: flex; justify-content: flex-end; }
+    .btn {
+      font: inherit; padding: 8px 16px; border-radius: 10px; cursor: pointer;
+      background: var(--midground); color: #170d02; font-weight: 600; border: none;
+    }
+    .btn:hover { filter: brightness(1.06); }
+    .host-row { display: flex; gap: 8px; max-width: 460px; }
+    .host-input {
+      flex: 1; min-width: 0; padding: 8px 10px; font: inherit;
+      color: var(--foreground); background: var(--panel);
+      border: 1px solid var(--hairline); border-radius: 10px;
+    }
+    .host-input:focus { outline: none; border-color: var(--midground); }
+  </style>
+</head>
+<body>
+  <h1>Hermes Agent</h1>
+  <p class="sub">Preferences for the browser extension.</p>
+
+  <fieldset>
+    <legend>Hermes host</legend>
+    <p class="sub" style="margin:0 0 8px">The base URL of your Hermes Agent dashboard.</p>
+    <div class="host-row">
+      <input type="text" id="host" class="host-input" spellcheck="false" autocapitalize="none"
+             placeholder="http://10.254.1.120:9119">
+      <button type="button" id="host-save" class="btn">Save host</button>
+    </div>
+    <div class="saved" id="host-saved"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Default view</legend>
+    <p class="sub" style="margin:0 0 8px">How the toolbar button and right-click menu open Hermes.</p>
+    <label class="opt">
+      <input type="radio" name="view" id="view-sidebar" value="sidebar">
+      <span><span class="label">Side pane</span><br><span class="desc">Open docked in Firefox's sidebar.</span></span>
+    </label>
+    <label class="opt">
+      <input type="radio" name="view" id="view-window" value="window">
+      <span><span class="label">Floating window</span><br><span class="desc">Open (or focus) a standalone window instead.</span></span>
+    </label>
+    <div class="saved" id="saved"></div>
+  </fieldset>
+
+  <div class="actions">
+    <button type="button" id="close" class="btn">Close</button>
+  </div>
+
+  <script src="../config.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "hermes-agent-firefox",
+  "version": "0.1.0",
+  "description": "Firefox extension to chat with a self-hosted Nous Research Hermes agent — sidebar/popout chat, multi-session buffering, page context, and interactive approvals.",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "lint": "web-ext lint --source-dir . --self-hosted",
+    "start": "web-ext run --source-dir .",
+    "build": "web-ext build --source-dir . --artifacts-dir web-ext-artifacts --overwrite-dest --ignore-files package.json package-lock.json README.md LICENSE .gitignore \".github/**\"",
+    "sign": "web-ext sign --source-dir . --artifacts-dir web-ext-artifacts --channel=unlisted --ignore-files package.json package-lock.json README.md LICENSE .gitignore \".github/**\""
+  },
+  "devDependencies": {
+    "web-ext": "^8.3.0"
+  }
+}

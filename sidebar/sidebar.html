@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Agent</title>
+  <link rel="stylesheet" href="sidebar.css">
+</head>
+<body>
+  <header class="bar">
+    <span class="brand">Nous<span class="dot"></span>Hermes</span>
+    <span class="bar-right">
+      <span id="status" class="status status--unknown" title="connection status">checking…</span>
+      <button type="button" id="settings" class="icon-btn bar-btn" title="Settings">⚙</button>
+      <button type="button" id="popout" class="icon-btn bar-btn" title="Pop out">⧉</button>
+    </span>
+  </header>
+
+  <div class="toolbar">
+    <select id="session-select" class="session-select" title="Switch chat session">
+      <option value="">＋ New chat</option>
+    </select>
+    <button type="button" id="session-refresh" class="icon-btn" title="Refresh session list">⟳</button>
+  </div>
+
+  <main id="log" class="log" aria-live="polite"></main>
+
+  <div id="context-chip" class="chip" hidden>
+    <span id="context-label" class="chip__label"></span>
+    <button id="context-clear" class="chip__x" title="Drop page context" aria-label="Drop page context">×</button>
+  </div>
+
+  <form id="composer" class="composer">
+    <button type="button" id="attach" class="icon-btn" title="Attach current page context">＋page</button>
+    <textarea id="input" class="input" rows="1" placeholder="Message Hermes…" autocomplete="off"></textarea>
+    <button type="submit" id="send" class="send">Send</button>
+  </form>
+
+  <!-- config.js defines the global HERMES config; sidebar.js drives the UI. -->
+  <script src="../config.js"></script>
+  <script src="sidebar.js"></script>
+</body>
+</html>

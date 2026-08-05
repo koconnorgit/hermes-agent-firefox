@@ -1,0 +1,553 @@
+// Sidebar controller: connection status, chat log, and the transport to Hermes.
+// The extension holds host_permissions for the Hermes origin, so fetch/WebSocket
+// from this document ride the user's existing dashboard session cookie
+// (credentials: "include"). No token juggling needed while the user is signed in.
+
+const { ENDPOINTS, DEFAULT_HOST } = globalThis.HERMES;
+let HOST = DEFAULT_HOST;   // live Hermes host, loaded from settings during init
+function hostOrigin() { return globalThis.HERMES.originPattern(HOST); }
+
+const el = {
+  status: document.getElementById("status"),
+  log: document.getElementById("log"),
+  form: document.getElementById("composer"),
+  input: document.getElementById("input"),
+  send: document.getElementById("send"),
+  attach: document.getElementById("attach"),
+  chip: document.getElementById("context-chip"),
+  chipLabel: document.getElementById("context-label"),
+  chipClear: document.getElementById("context-clear"),
+  sessionSelect: document.getElementById("session-select"),
+  sessionRefresh: document.getElementById("session-refresh"),
+  popout: document.getElementById("popout"),
+  settings: document.getElementById("settings"),
+};
+
+// This same document runs in two places: the sidebar (default_panel) and a
+// floating popup window (opened with ?ctx=window). The button flips accordingly.
+const isWindow = new URLSearchParams(location.search).get("ctx") === "window";
+
+let attachedContext = null; // { title, url, excerpt/selection } sent with next msg
+
+// ── UI helpers ─────────────────────────────────────────────────────────────
+function addMsg(role, text = "") {
+  const div = document.createElement("div");
+  div.className = `msg msg--${role}`;
+  div.textContent = text;
+  el.log.appendChild(div);
+  el.log.scrollTop = el.log.scrollHeight;
+  return div;
+}
+function setStatus(kind, label) {
+  el.status.className = `status status--${kind}`;
+  el.status.textContent = label;
+}
+function setContext(ctx, label) {
+  attachedContext = ctx;
+  if (ctx) {
+    el.chipLabel.textContent = label || ctx.title || ctx.url || "page context";
+    el.chip.hidden = false;
+  } else {
+    el.chip.hidden = true;
+  }
+}
+
+// ── Host-permission gate (Firefox MV3) ────────────────────────────────────
+// In Firefox MV3 the manifest's host_permissions are OPTIONAL and are not
+// granted at install/load time. Without the grant, fetch() to the Hermes origin
+// is refused and rejects — which looks like "unreachable". Detect that case and
+// offer a one-click grant (permissions.request must run from a user gesture).
+async function hasHostPermission() {
+  try {
+    return await browser.permissions.contains({ origins: [hostOrigin()] });
+  } catch { return false; }
+}
+
+function promptForPermission() {
+  setStatus("off", "needs access");
+  const note = addMsg("system", "This add-on needs permission to talk to the Hermes host. ");
+  const btn = document.createElement("button");
+  btn.textContent = "Grant access to Hermes";
+  btn.className = "send";
+  btn.style.marginTop = "6px";
+  btn.addEventListener("click", async () => {
+    const granted = await browser.permissions
+      .request({ origins: [hostOrigin()] })
+      .catch(() => false);
+    if (granted) { note.remove(); checkAuth(); }
+    else addMsg("system", "Permission not granted. You can also enable it in about:addons → Hermes Agent → Permissions.");
+  });
+  note.appendChild(document.createElement("br"));
+  note.appendChild(btn);
+}
+
+// ── Auth / connectivity check ──────────────────────────────────────────────
+// The actual fetch runs in the background page (see background.js) to dodge the
+// sidebar's cross-origin restrictions; here we just interpret the result.
+async function checkAuth() {
+  setStatus("unknown", "checking…");
+  if (!(await hasHostPermission())) { promptForPermission(); return false; }
+
+  const res = await browser.runtime
+    .sendMessage({ type: "hermes:whoami" })
+    .catch((e) => ({ ok: false, error: e.message }));
+
+  if (res.ok) { setStatus("ok", "connected"); return true; }
+
+  if (res.status === 401) {
+    setStatus("off", "signed out");
+    addMsg("system", "Not signed in. Open the Hermes dashboard, log in, then reload this sidebar.");
+    const a = document.createElement("a");
+    a.textContent = "Open dashboard login →";
+    a.href = HOST + "/login";
+    a.target = "_blank";
+    a.style.color = "var(--midground)";
+    el.log.lastChild.appendChild(document.createElement("br"));
+    el.log.lastChild.appendChild(a);
+    return false;
+  }
+
+  if (res.error) {
+    setStatus("off", "blocked");
+    addMsg(
+      "system",
+      `Background request to ${HOST} threw: ${res.error}\n` +
+      `If this still says NetworkError, the HTTP origin itself is being refused — ` +
+      `tell me and we'll look at serving Hermes over HTTPS or a local proxy.`
+    );
+    return false;
+  }
+
+  setStatus("off", `error ${res.status}`);
+  return false;
+}
+
+// ── Transport: the background is the session hub; we render the active one ───
+// The background keeps every opened session live and buffers each transcript, so
+// switching never loses an in-flight reply. Here we render whatever session the
+// background marks active (full "log"), apply incremental stream ops, and show
+// other sessions' activity (busy/unread) in the dropdown.
+let gatewayPort = null;
+let viewingStoredId = null;    // storedId the log currently shows
+let streamBubble = null;       // current streaming assistant bubble
+let lastToolBubble = null;     // most recent "running tool" note
+const sessionMeta = new Map(); // storedId → { busy, unread } for dropdown markers
+
+function connectGateway() {
+  if (gatewayPort) return gatewayPort;
+  const port = browser.runtime.connect({ name: "hermes:gateway" });
+  gatewayPort = port;
+  port.onMessage.addListener(onGatewayMessage);
+  port.onDisconnect.addListener(() => { gatewayPort = null; });
+  return port;
+}
+
+function onGatewayMessage(m) {
+  switch (m.type) {
+    case "log":        renderLog(m.storedId, m.items, m.busy); break;
+    case "render":     if (m.storedId === viewingStoredId) applyRenderOp(m); break;
+    case "activity":   onActivity(m); break;
+    case "notify":     break; // OS notification is fired by the background
+    case "sessions-changed": scheduleSessionsReload(); break;
+    case "closed":
+      setStatus("off", "disconnected");
+      if (streamBubble) { streamBubble.classList.remove("streaming"); streamBubble = null; }
+      if (m.code && m.code !== 1000) addMsg("system", `Gateway closed (code ${m.code}${m.reason ? ": " + m.reason : ""}).`);
+      break;
+    case "error":
+      setStatus("off", "error");
+      addMsg("system", `⚠ ${m.error}`);
+      el.send.disabled = false;
+      break;
+  }
+}
+
+// Build a bubble for one buffered item.
+function renderItem(item) {
+  if (item.kind === "user") return addMsg("user", item.text);
+  if (item.kind === "assistant") {
+    const b = addMsg("agent", item.text || "");
+    if (item.streaming) { b.classList.add("streaming"); streamBubble = b; }
+    return b;
+  }
+  if (item.kind === "tool") {
+    const b = addMsg("system", `${item.done ? "✓" : "⚙"} ${item.name || "tool"}`);
+    if (!item.done) lastToolBubble = b;
+    return b;
+  }
+  if (item.kind === "request") return renderRequest(item);
+  return addMsg("system", item.text || "");
+}
+
+// Interactive approval / clarify / sudo / secret request card.
+const REQ_HEAD = {
+  approval: "⚠ Approve this command?",
+  clarify: "❔ Hermes is asking:",
+  sudo: "🔒 Password required",
+  secret: "🔑 Secret required",
+};
+const CHOICE_LABEL = { once: "Approve once", session: "Approve for session", always: "Always approve", approve: "Approve", deny: "Deny" };
+const prettyChoice = (c) => CHOICE_LABEL[c] || c;
+
+function renderRequest(item) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg msg--request";
+  el.log.appendChild(wrap);
+
+  if (item.resolved) {
+    wrap.classList.add("resolved");
+    wrap.textContent = `▸ ${item.rtype} — ${item.answer || "resolved"}`;
+    el.log.scrollTop = el.log.scrollHeight;
+    return wrap;
+  }
+
+  const finish = (label) => { wrap.className = "msg msg--request resolved"; wrap.textContent = `▸ ${item.rtype} — ${label}`; };
+
+  const head = document.createElement("div");
+  head.className = "req-head";
+  head.textContent = REQ_HEAD[item.rtype] || "Hermes needs input";
+  wrap.appendChild(head);
+
+  if (item.rtype === "approval" && item.command) {
+    const pre = document.createElement("pre"); pre.className = "req-cmd"; pre.textContent = item.command; wrap.appendChild(pre);
+  } else if (item.question) {
+    const q = document.createElement("div"); q.className = "req-q"; q.textContent = item.question; wrap.appendChild(q);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "req-actions";
+
+  if (item.choices && item.choices.length && item.multi) {
+    // Multi-select clarify: toggle each choice, then Send. Answer is a JSON array.
+    const selected = new Set();
+    for (const ch of item.choices) {
+      const btn = document.createElement("button");
+      btn.className = "req-btn req-btn--toggle"; btn.textContent = ch;
+      btn.setAttribute("aria-pressed", "false");
+      btn.addEventListener("click", () => {
+        const on = selected.has(ch);
+        if (on) selected.delete(ch); else selected.add(ch);
+        btn.classList.toggle("on", !on);
+        btn.setAttribute("aria-pressed", String(!on));
+      });
+      actions.appendChild(btn);
+    }
+    const send = document.createElement("button");
+    send.className = "req-btn"; send.textContent = "Send";
+    send.addEventListener("click", () => {
+      const arr = item.choices.filter((c) => selected.has(c));
+      finish(arr.join(", ") || "(none)");
+      respondRequest(item, arr.join(", "), { answer: JSON.stringify(arr) });
+    });
+    actions.appendChild(send);
+  } else if (item.choices && item.choices.length) {
+    for (const ch of item.choices) {
+      const btn = document.createElement("button");
+      btn.className = "req-btn" + (ch === "deny" ? " req-btn--danger" : "");
+      btn.textContent = prettyChoice(ch);
+      btn.addEventListener("click", () => {
+        finish(prettyChoice(ch));
+        respondRequest(item, prettyChoice(ch), item.rtype === "approval" ? { choice: ch } : { answer: ch });
+      });
+      actions.appendChild(btn);
+    }
+  } else {
+    const secret = item.rtype === "sudo" || item.rtype === "secret";
+    const input = document.createElement("input");
+    input.className = "req-input";
+    input.type = secret ? "password" : "text";
+    input.placeholder = item.rtype === "sudo" ? "Password" : item.rtype === "secret" ? "Secret value" : "Your answer";
+    const btn = document.createElement("button");
+    btn.className = "req-btn"; btn.textContent = "Send";
+    const go = () => {
+      const val = input.value;
+      if (!val && item.rtype !== "clarify") return;
+      const key = item.rtype === "sudo" ? "password" : item.rtype === "secret" ? "value" : "answer";
+      finish(secret ? "•••" : val || "(skipped)");
+      respondRequest(item, secret ? "•••" : val, { [key]: val });
+    };
+    btn.addEventListener("click", go);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } });
+    actions.appendChild(input); actions.appendChild(btn);
+  }
+
+  wrap.appendChild(actions);
+  el.log.scrollTop = el.log.scrollHeight;
+  return wrap;
+}
+
+function respondRequest(item, label, extra) {
+  connectGateway().postMessage({
+    type: "respond", rtype: item.rtype, liveId: item.liveId, requestId: item.requestId, label, ...extra,
+  });
+}
+
+function renderLog(storedId, items, busy) {
+  viewingStoredId = storedId;
+  streamBubble = null; lastToolBubble = null;
+  el.log.innerHTML = "";
+  for (const item of items || []) renderItem(item);
+  el.log.scrollTop = el.log.scrollHeight;
+  const meta = sessionMeta.get(storedId); if (meta) { meta.unread = false; decorateOption(storedId); }
+  syncDropdownTo(storedId);
+  setStatus("ok", busy ? "working…" : "connected");
+  el.send.disabled = !!busy;
+}
+
+function applyRenderOp(m) {
+  switch (m.op) {
+    case "push":
+      renderItem(m.item);
+      el.log.scrollTop = el.log.scrollHeight;
+      break;
+    case "delta":
+      if (streamBubble) { streamBubble.textContent += m.text; el.log.scrollTop = el.log.scrollHeight; }
+      break;
+    case "end":
+      if (streamBubble) {
+        if (!streamBubble.textContent && typeof m.text === "string") streamBubble.textContent = m.text;
+        streamBubble.classList.remove("streaming"); streamBubble = null;
+      }
+      break;
+    case "toolDone":
+      if (lastToolBubble) { lastToolBubble.textContent = `✓ ${m.name || "tool"}`; lastToolBubble = null; }
+      break;
+  }
+}
+
+function onActivity(m) {
+  sessionMeta.set(m.storedId, { busy: m.busy, unread: m.unread });
+  if (m.storedId === viewingStoredId) {
+    setStatus("ok", m.busy ? "working…" : "connected");
+    el.send.disabled = !!m.busy;
+  }
+  decorateOption(m.storedId);
+}
+
+// Fold any attached page context into the prompt text (prompt.submit takes text).
+function composePrompt(text) {
+  if (!attachedContext) return text;
+  const c = attachedContext;
+  const parts = [`[Page context — ${c.title || c.url || "current tab"}]`];
+  if (c.url) parts.push(`URL: ${c.url}`);
+  if (c.selection) parts.push(`Selected text:\n${c.selection}`);
+  else if (c.excerpt) parts.push(`Page text (excerpt):\n${c.excerpt}`);
+  parts.push(`\n---\n${text}`);
+  return parts.join("\n");
+}
+
+function send(text) {
+  if (!text.trim()) return;
+  el.send.disabled = true;
+  const composed = composePrompt(text);
+  setContext(null);                 // context consumed once sent
+  // The user + assistant bubbles arrive back as render ops from the background.
+  connectGateway().postMessage({ type: "prompt", text: composed, display: text });
+}
+
+// ── Sessions dropdown ───────────────────────────────────────────────────────
+async function apiGet(path) {
+  const res = await browser.runtime
+    .sendMessage({ type: "hermes:api", path })
+    .catch((e) => ({ ok: false, error: e.message }));
+  if (!res?.ok) throw new Error(res?.error || `GET ${path} → ${res?.status}`);
+  return res.data;
+}
+
+let sessionsReloadTimer = null;
+function scheduleSessionsReload() {          // debounce: sessions.changed fires in bursts
+  clearTimeout(sessionsReloadTimer);
+  sessionsReloadTimer = setTimeout(loadSessions, 400);
+}
+
+function optionFor(storedId) {
+  return [...el.sessionSelect.options].find((o) => o.value === storedId);
+}
+function decorateOption(storedId) {          // prefix a marker for unread/busy sessions
+  const opt = optionFor(storedId);
+  if (!opt || !opt.dataset.base) return;
+  const meta = sessionMeta.get(storedId);
+  const mark = meta?.unread ? "● " : meta?.busy ? "… " : "";
+  opt.textContent = mark + opt.dataset.base;
+}
+function syncDropdownTo(storedId) {
+  el.sessionSelect.value = optionFor(storedId) ? storedId : "";
+}
+
+async function loadSessions() {
+  try {
+    const data = await apiGet(ENDPOINTS.sessions);
+    const sessions = (data?.sessions || [])
+      .filter((s) => (s.message_count || 0) > 0)   // hide empty throwaway sockets, keep real chats
+      .sort((a, b) => (b.last_activity_at || b.started_at || 0) - (a.last_activity_at || a.started_at || 0));
+    const current = el.sessionSelect.value;
+    el.sessionSelect.innerHTML = '<option value="">＋ New chat</option>';
+    for (const s of sessions) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      const label = (s.title || s.id).slice(0, 42);
+      opt.dataset.base = s.message_count ? `${label} (${s.message_count})` : label;
+      opt.textContent = opt.dataset.base;
+      el.sessionSelect.appendChild(opt);
+      decorateOption(s.id);
+    }
+    // Prefer the session actually being viewed (survives the reopen race where
+    // the log restores before the options exist); otherwise keep prior selection.
+    const target = viewingStoredId && optionFor(viewingStoredId) ? viewingStoredId : current;
+    el.sessionSelect.value = target || "";
+  } catch (e) {
+    console.warn("[hermes] loadSessions failed:", e);
+  }
+}
+
+function selectSession(storedId) {
+  el.send.disabled = true;
+  connectGateway().postMessage({ type: "view", storedId });   // background resumes + sends the log
+}
+
+function newChat() {
+  connectGateway().postMessage({ type: "new" });              // background creates + sends an empty log
+}
+
+// ── Pop out / dock ──────────────────────────────────────────────────────────
+// The session hub (transcripts, active session) lives in the background page, so
+// it survives the move — the reopened view just asks for the active session's log
+// via "resumeActive". The handoff only carries the window we popped out from.
+let dockTargetWindowId = null;   // the normal window we popped out from (window ctx)
+let myWindowId = null;           // this document's own window (cached at init)
+
+async function saveHandoff(extra = {}) {
+  await browser.storage.session.set({ handoff: { ...extra } });
+}
+async function consumeHandoff() {
+  const { handoff } = await browser.storage.session.get("handoff");
+  if (handoff) await browser.storage.session.remove("handoff");
+  return handoff || null;
+}
+
+function popOut() {
+  // Save state (fire — the popup reads it once it loads), have the BACKGROUND
+  // open the window, then close our own sidebar synchronously. Creating the
+  // window in the background is what lets us close the sidebar immediately
+  // without the popup stealing focus first (which used to leave both open).
+  saveHandoff({ originWindowId: myWindowId });
+  browser.runtime.sendMessage({ type: "hermes:openWindow" });
+  browser.sidebarAction.close().catch((e) => console.warn("[hermes] sidebar close failed:", e));
+}
+
+async function dock() {
+  // Firefox won't let a popup auto-open a normal window's sidebar (no gesture it
+  // can satisfy), so docking: persist state, focus the origin window, close the
+  // popup. The user reopens the pane via the toolbar icon or Ctrl+Shift+Y — the
+  // sidebar restores this state from the handoff on open. The open() below is a
+  // harmless best-effort in case a Firefox build ever allows it.
+  await saveHandoff();
+  try {
+    if (dockTargetWindowId != null) {
+      await browser.windows.update(dockTargetWindowId, { focused: true });
+    }
+    await browser.sidebarAction.open();
+  } catch (e) {
+    console.warn("[hermes] dock open (best-effort) failed:", e);
+  }
+  window.close();
+}
+
+function setupPopButton() {
+  if (isWindow) {
+    el.popout.textContent = "⤓";
+    el.popout.title = "Dock (reopen the pane via the toolbar icon or Ctrl+Shift+Y)";
+    el.popout.addEventListener("click", dock);
+  } else {
+    el.popout.title = "Pop out to a floating window";
+    el.popout.addEventListener("click", popOut);
+  }
+}
+
+// ── Page-context attach ────────────────────────────────────────────────────
+async function attachActivePage() {
+  const resp = await browser.runtime
+    .sendMessage({ type: "hermes:requestActiveContext" })
+    .catch(() => null);
+  if (resp?.context) {
+    const c = resp.context;
+    setContext(
+      { url: c.url, title: c.title, selection: c.selection, excerpt: c.excerpt },
+      c.selection ? `selection · ${c.title || c.url}` : c.title || c.url
+    );
+  } else {
+    addMsg("system", "Couldn't read the active tab (some pages block content scripts).");
+  }
+}
+
+// ── Tasks pushed from the context menu / toolbar ───────────────────────────
+async function drainPendingTask() {
+  const { pendingTask } = await browser.storage.session.get("pendingTask");
+  if (pendingTask) {
+    await browser.storage.session.remove("pendingTask");
+    applyTask(pendingTask);
+  }
+}
+function applyTask(task) {
+  if (task.kind === "selection") {
+    setContext({ url: task.url, title: task.title, selection: task.text }, `selection · ${task.title || task.url}`);
+    el.input.value = "Explain this selection.";
+  } else if (task.kind === "page" && task.context) {
+    const c = task.context;
+    setContext({ url: c.url, title: c.title, excerpt: c.excerpt }, c.title || c.url);
+    el.input.value = "Summarize this page.";
+  }
+  el.input.focus();
+}
+browser.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === "hermes:pendingTask" && msg.task) {
+    applyTask(msg.task);
+    browser.storage.session.remove("pendingTask");  // consumed here; don't let init replay it
+  }
+});
+
+// ── Wiring ─────────────────────────────────────────────────────────────────
+el.form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = el.input.value;
+  el.input.value = "";
+  el.input.style.height = "auto";
+  send(text);
+});
+el.input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); el.form.requestSubmit(); }
+});
+el.input.addEventListener("input", () => {
+  el.input.style.height = "auto";
+  el.input.style.height = Math.min(el.input.scrollHeight, 140) + "px";
+});
+el.attach.addEventListener("click", attachActivePage);
+el.chipClear.addEventListener("click", () => setContext(null));
+el.sessionSelect.addEventListener("change", () => {
+  const v = el.sessionSelect.value;
+  if (v) selectSession(v); else newChat();
+});
+el.sessionRefresh.addEventListener("click", loadSessions);
+el.settings.addEventListener("click", () => browser.runtime.openOptionsPage());
+setupPopButton();
+browser.windows.getCurrent().then((w) => { myWindowId = w.id; }).catch(() => {});
+
+(async () => {
+  // Context-menu "fresh open" → ask for a NEW session. Otherwise re-attach to the
+  // active session (the background sends its full buffered log either way).
+  const { settings } = await browser.storage.local.get("settings");
+  if (settings?.host) HOST = settings.host;   // point at the configured Hermes host
+
+  const { pendingTask } = await browser.storage.session.get("pendingTask");
+  const handoff = await consumeHandoff();
+  const freshOpen = !!pendingTask?.freshOpen;
+  if (handoff?.originWindowId != null) dockTargetWindowId = handoff.originWindowId;
+
+  const ok = await checkAuth();
+  if (ok) {
+    const port = connectGateway();
+    port.postMessage(freshOpen ? { type: "new" } : { type: "resumeActive" });
+    await loadSessions();
+  }
+  drainPendingTask();                              // apply the selection/page context, if any
+})();

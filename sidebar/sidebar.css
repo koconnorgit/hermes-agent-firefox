@@ -1,0 +1,120 @@
+/* Palette lifted from the Hermes dashboard so the sidebar feels native. */
+:root {
+  --background: #170d02;
+  --panel: #1e1305;
+  --midground: #ffac02;
+  --foreground: #ffffff;
+  --muted: color-mix(in srgb, #ffffff 55%, transparent);
+  --hairline: color-mix(in srgb, #ffac02 18%, transparent);
+  --user-bubble: color-mix(in srgb, #ffac02 16%, #170d02);
+  --agent-bubble: #241706;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--background);
+  color: var(--foreground);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+body { display: flex; flex-direction: column; height: 100vh; }
+
+.bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; border-bottom: 1px solid var(--hairline);
+}
+.brand { font-weight: 700; letter-spacing: .02em; }
+.brand .dot {
+  display: inline-block; width: 6px; height: 6px; margin: 0 3px;
+  border-radius: 50%; background: var(--midground); vertical-align: middle;
+}
+
+.bar-right { display: flex; align-items: center; gap: 8px; }
+.bar-btn { padding: 2px 8px; font-size: 15px; line-height: 1; }
+
+.status { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--hairline); }
+.status--ok      { color: #7ee081; border-color: color-mix(in srgb, #7ee081 40%, transparent); }
+.status--off     { color: #ff8f6b; border-color: color-mix(in srgb, #ff8f6b 40%, transparent); }
+.status--unknown { color: var(--muted); }
+
+.toolbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px; border-bottom: 1px solid var(--hairline);
+}
+.session-select {
+  flex: 1; min-width: 0; padding: 5px 8px; font: inherit; font-size: 12px;
+  color: var(--foreground); background: var(--panel);
+  border: 1px solid var(--hairline); border-radius: 8px;
+}
+.session-select:focus { outline: none; border-color: var(--midground); }
+
+.log { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+
+.msg { max-width: 92%; padding: 8px 11px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+.msg--user  { align-self: flex-end; background: var(--user-bubble); border: 1px solid var(--hairline); }
+.msg--agent { align-self: flex-start; background: var(--agent-bubble); }
+.msg--system { align-self: center; color: var(--muted); font-size: 12px; background: transparent; }
+.msg--agent.streaming::after { content: "▌"; color: var(--midground); animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* Interactive approval / clarify / sudo / secret request card */
+.msg--request {
+  align-self: stretch; max-width: 100%;
+  background: color-mix(in srgb, var(--midground) 10%, var(--agent-bubble));
+  border: 1px solid var(--hairline-strong); border-radius: 12px; padding: 10px 12px;
+}
+.msg--request.resolved { color: var(--muted); background: transparent; border-color: var(--hairline); }
+.req-head { font-weight: 600; margin-bottom: 6px; }
+.req-cmd {
+  margin: 0 0 8px; padding: 8px; overflow-x: auto; white-space: pre;
+  background: #120a02; border: 1px solid var(--hairline); border-radius: 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+}
+.req-q { margin-bottom: 8px; white-space: pre-wrap; }
+.req-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.req-btn {
+  font: inherit; font-size: 12px; padding: 6px 10px; border-radius: 8px; cursor: pointer;
+  background: var(--midground); color: #170d02; font-weight: 600; border: 1px solid transparent;
+}
+.req-btn--danger { background: transparent; color: #ff8f6b; border-color: color-mix(in srgb, #ff8f6b 45%, transparent); }
+/* Multi-select toggles: outline when off, filled amber when on. */
+.req-btn--toggle { background: transparent; color: var(--foreground); border-color: var(--hairline-strong); }
+.req-btn--toggle.on { background: var(--midground); color: #170d02; border-color: transparent; }
+.req-btn--toggle.on::before { content: "✓ "; }
+.req-btn:hover { filter: brightness(1.06); }
+.req-input {
+  flex: 1; min-width: 120px; padding: 6px 8px; font: inherit;
+  background: var(--panel); color: var(--foreground);
+  border: 1px solid var(--hairline); border-radius: 8px;
+}
+.req-input:focus { outline: none; border-color: var(--midground); }
+
+.chip {
+  display: flex; align-items: center; gap: 8px; margin: 0 12px 6px;
+  padding: 5px 10px; font-size: 12px; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--hairline); border-radius: 8px;
+}
+/* Author `display:flex` above would otherwise override the UA [hidden] rule,
+   leaving the chip permanently visible (and empty). Restore hide-when-hidden. */
+.chip[hidden] { display: none; }
+.chip__label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip__x { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; }
+
+.composer { display: flex; gap: 6px; padding: 10px; border-top: 1px solid var(--hairline); align-items: flex-end; }
+.input {
+  flex: 1; resize: none; max-height: 140px; padding: 8px 10px;
+  background: var(--panel); color: var(--foreground);
+  border: 1px solid var(--hairline); border-radius: 10px; font: inherit;
+}
+.input:focus { outline: none; border-color: var(--midground); }
+
+.icon-btn, .send {
+  border: 1px solid var(--hairline); border-radius: 10px; cursor: pointer;
+  background: var(--panel); color: var(--foreground); padding: 8px 10px; font: inherit;
+}
+.send { background: var(--midground); color: #170d02; font-weight: 600; border-color: transparent; }
+.send:disabled { opacity: .5; cursor: default; }
+.icon-btn { font-size: 12px; color: var(--muted); white-space: nowrap; }

@@ -1,0 +1,27 @@
+// Shared config, loaded as a classic script in the background page and the
+// sidebar/options documents. Everything hangs off the global `HERMES`.
+//
+// The Hermes host is user-configurable (Settings → Host). This file holds only
+// the DEFAULT host and host-independent endpoint paths; each context reads the
+// live host from storage.local (`settings.host`) at runtime and builds URLs from
+// the helpers below.
+globalThis.HERMES = {
+  // Placeholder default — set your actual Hermes host per-install in the
+  // extension's Settings (⚙), or change this default for your own build.
+  DEFAULT_HOST: "http://localhost:9119",
+
+  // Host-independent paths. The API lives under /api (NOT /api/v1).
+  ENDPOINTS: {
+    whoami: "/api/auth/me",              // identity / "am I logged in?" probe
+    sessions: "/api/sessions",           // session list
+    messages: (sid) => `/api/sessions/${sid}/messages`, // a session's transcript
+    wsTicket: "/api/auth/ws-ticket",     // short-lived ticket for the /api/ws socket
+    login: "/auth/password-login",       // cookie login
+  },
+
+  normHost(host) { return String(host || "").replace(/\/+$/, ""); },
+  // ws://host/api/ws (or wss:// for an https host) — the JSON-RPC socket.
+  wsUrl(host) { return this.normHost(host).replace(/^http/i, "ws") + "/api/ws"; },
+  // Match pattern for host_permissions / permissions.request.
+  originPattern(host) { return this.normHost(host) + "/*"; },
+};
