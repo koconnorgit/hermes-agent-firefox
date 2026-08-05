@@ -21,7 +21,18 @@ const el = {
   sessionRefresh: document.getElementById("session-refresh"),
   popout: document.getElementById("popout"),
   settings: document.getElementById("settings"),
+  waiting: document.getElementById("waiting"),
 };
+
+let notifyCfg = globalThis.HERMES.notifyConfig(null);  // per-surface toggles, loaded from settings
+
+// Show/hide the "response waiting" pill note and the dropdown ring when another
+// session has an unread reply (each gated by its setting).
+function updateUnreadIndicators() {
+  const anyUnread = [...sessionMeta.values()].some((m) => m.unread);
+  el.waiting.hidden = !(anyUnread && notifyCfg.pill);
+  el.sessionSelect.classList.toggle("has-unread", anyUnread && notifyCfg.dropdown);
+}
 
 // This same document runs in two places: the sidebar (default_panel) and a
 // floating popup window (opened with ?ctx=window). The button flips accordingly.
@@ -295,6 +306,7 @@ function renderLog(storedId, items, busy) {
   for (const item of items || []) renderItem(item);
   el.log.scrollTop = el.log.scrollHeight;
   const meta = sessionMeta.get(storedId); if (meta) { meta.unread = false; decorateOption(storedId); }
+  updateUnreadIndicators();
   syncDropdownTo(storedId);
   setStatus("ok", busy ? "working…" : "connected");
   el.send.disabled = !!busy;
@@ -328,6 +340,7 @@ function onActivity(m) {
     el.send.disabled = !!m.busy;
   }
   decorateOption(m.storedId);
+  updateUnreadIndicators();
 }
 
 // Fold any attached page context into the prompt text (prompt.submit takes text).
@@ -543,10 +556,10 @@ browser.windows.getCurrent().then((w) => { myWindowId = w.id; }).catch(() => {})
 // socket on the same event — see background.js.)
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes.settings) return;
+  notifyCfg = globalThis.HERMES.notifyConfig(changes.settings.newValue);
+  updateUnreadIndicators();   // reflect toggled indicators immediately
   const newHost = changes.settings.newValue?.host || DEFAULT_HOST;
-  if (newHost === HOST) return;
-  HOST = newHost;
-  reconnect();
+  if (newHost !== HOST) { HOST = newHost; reconnect(); }
 });
 
 async function reconnect() {
@@ -564,6 +577,7 @@ async function reconnect() {
   // active session (the background sends its full buffered log either way).
   const { settings } = await browser.storage.local.get("settings");
   if (settings?.host) HOST = settings.host;   // point at the configured Hermes host
+  notifyCfg = globalThis.HERMES.notifyConfig(settings);
 
   const { pendingTask } = await browser.storage.session.get("pendingTask");
   const handoff = await consumeHandoff();

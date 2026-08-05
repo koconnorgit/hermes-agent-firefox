@@ -24,7 +24,9 @@
     .opt .label { font-weight: 600; }
     .opt .desc { color: var(--muted); font-size: 12px; }
     .saved { color: #7ee081; font-size: 12px; height: 16px; }
-    .actions { max-width: 460px; display: flex; justify-content: flex-end; }
+    .actions { max-width: 460px; display: flex; justify-content: space-between; align-items: center; }
+    .ver { color: var(--muted); font-size: 12px; }
+    .opt input[type="checkbox"] { accent-color: var(--midground); }
     .btn {
       font: inherit; padding: 8px 16px; border-radius: 10px; cursor: pointer;
       background: var(--midground); color: #170d02; font-weight: 600; border: none;
@@ -68,7 +70,30 @@
     <div class="saved" id="saved"></div>
   </fieldset>
 
+  <fieldset>
+    <legend>Notifications</legend>
+    <p class="sub" style="margin:0 0 8px">Signals when another session has a reply waiting.</p>
+    <label class="opt">
+      <input type="checkbox" id="n-badge">
+      <span><span class="label">Toolbar badge</span><br><span class="desc">Red count on the extension icon.</span></span>
+    </label>
+    <label class="opt">
+      <input type="checkbox" id="n-dropdown">
+      <span><span class="label">Highlight the session dropdown</span><br><span class="desc">Red ring around the chat selector.</span></span>
+    </label>
+    <label class="opt">
+      <input type="checkbox" id="n-pill">
+      <span><span class="label">“Response waiting” note</span><br><span class="desc">Shown next to the connection status.</span></span>
+    </label>
+    <label class="opt">
+      <input type="checkbox" id="n-system">
+      <span><span class="label">Desktop notification</span><br><span class="desc">A system notification when a reply lands.</span></span>
+    </label>
+    <div class="saved" id="notify-saved"></div>
+  </fieldset>
+
   <div class="actions">
+    <span class="ver" id="version"></span>
     <button type="button" id="close" class="btn">Close</button>
   </div>
 

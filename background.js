@@ -33,16 +33,20 @@ browser.runtime.onInstalled.addListener(() => {
 // because sidebarAction.open() must run inside the user gesture (no awaiting
 // storage first).
 let defaultView = "sidebar"; // "sidebar" | "window"
+let notifyCfg = globalThis.HERMES.notifyConfig(null);  // badge / system toggles
 let settingsLoaded = false;  // false until the cached value is read (matters on cold start)
 browser.storage.local.get("settings").then(({ settings }) => {
   if (settings?.defaultView) defaultView = settings.defaultView;
   if (settings?.host) HOST = settings.host;
+  notifyCfg = globalThis.HERMES.notifyConfig(settings);
   settingsLoaded = true;
 });
 browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.settings) {
     const s = changes.settings.newValue || {};
     defaultView = s.defaultView || "sidebar";
+    notifyCfg = globalThis.HERMES.notifyConfig(s);
+    gateway.updateBadge();   // reflect a toggled badge setting right away
     const newHost = s.host || DEFAULT_HOST;
     if (newHost !== HOST) {
       HOST = newHost;
@@ -393,23 +397,24 @@ class Gateway {
   _activity(s) { this.broadcast({ type: "activity", storedId: s.storedId, busy: s.busy, unread: s.unread }); }
   _completed(s) {
     if (!this._isActive(s)) { s.unread = true; this._activity(s); this._notify(s); }
-    this._updateBadge();
+    this.updateBadge();
   }
   _needsInput(s) {   // the agent is blocked waiting for an answer
     if (!this._isActive(s)) { s.unread = true; this._activity(s); this._notify(s, "Hermes needs your input."); }
-    this._updateBadge();
+    this.updateBadge();
   }
   _notify(s, message = "New reply in another session.") {
     this.broadcast({ type: "notify", storedId: s.storedId });
+    if (!notifyCfg.system) return;
     try {
       browser.notifications.create(`hermes:${s.storedId}`, { type: "basic", title: "Hermes Agent", message });
     } catch {}
   }
-  _updateBadge() {
-    const n = [...this.sessions.values()].filter((x) => x.unread).length;
+  updateBadge() {
+    const n = notifyCfg.badge ? [...this.sessions.values()].filter((x) => x.unread).length : 0;
     try {
       browser.action.setBadgeText({ text: n ? String(n) : "" });
-      browser.action.setBadgeBackgroundColor({ color: "#ffac02" });
+      browser.action.setBadgeBackgroundColor({ color: "#e5484d" });   // red = attention
     } catch {}
   }
 
@@ -417,7 +422,7 @@ class Gateway {
   async view(storedId) {
     const s = await this.openSession(storedId);
     this.active = storedId;
-    s.unread = false; this._updateBadge();
+    s.unread = false; this.updateBadge();
     this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
     return s;
   }
@@ -457,7 +462,7 @@ browser.runtime.onConnect.addListener((port) => {
       else if (m?.type === "respond") await gateway.respond(m);
       else if (m?.type === "markRead" && m.storedId) {
         const s = gateway.sessions.get(m.storedId);
-        if (s) { s.unread = false; gateway._updateBadge(); }
+        if (s) { s.unread = false; gateway.updateBadge(); }
       }
     } catch (e) {
       port.postMessage({ type: "error", error: `${e.name || "Error"}: ${e.message}` });

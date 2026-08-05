@@ -1,6 +1,6 @@
 // Settings persisted in storage.local as { settings: { defaultView, host } }.
 // The background page caches these and reacts via storage.onChanged.
-const { DEFAULT_HOST, normHost, originPattern } = globalThis.HERMES;
+const { DEFAULT_HOST, normHost, originPattern, notifyConfig } = globalThis.HERMES;
 
 const radios = {
   sidebar: document.getElementById("view-sidebar"),
@@ -9,6 +9,13 @@ const radios = {
 const saved = document.getElementById("saved");
 const hostInput = document.getElementById("host");
 const hostSaved = document.getElementById("host-saved");
+const notifyBoxes = {
+  badge: document.getElementById("n-badge"),
+  dropdown: document.getElementById("n-dropdown"),
+  pill: document.getElementById("n-pill"),
+  system: document.getElementById("n-system"),
+};
+const notifySaved = document.getElementById("notify-saved");
 
 async function getSettings() {
   const { settings } = await browser.storage.local.get("settings");
@@ -23,6 +30,17 @@ async function load() {
   const s = await getSettings();
   radios[s.defaultView === "window" ? "window" : "sidebar"].checked = true;
   hostInput.value = s.host || DEFAULT_HOST;
+  const n = notifyConfig(s);
+  for (const [key, box] of Object.entries(notifyBoxes)) box.checked = !!n[key];
+  document.getElementById("version").textContent = "v" + browser.runtime.getManifest().version;
+}
+
+async function saveNotify() {
+  const notify = {};
+  for (const [key, box] of Object.entries(notifyBoxes)) notify[key] = box.checked;
+  await patchSettings({ notify });
+  notifySaved.textContent = "Saved.";
+  setTimeout(() => { notifySaved.textContent = ""; }, 1500);
 }
 
 async function saveView() {
@@ -58,6 +76,7 @@ async function saveHost() {
 
 radios.sidebar.addEventListener("change", saveView);
 radios.window.addEventListener("change", saveView);
+for (const box of Object.values(notifyBoxes)) box.addEventListener("change", saveNotify);
 document.getElementById("host-save").addEventListener("click", saveHost);
 hostInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveHost(); } });
 

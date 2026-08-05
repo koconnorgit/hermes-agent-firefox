@@ -52,40 +52,41 @@ hosts work — Firefox normally auto-upgrades `http://` from extensions to
 `https://`, but this extension suppresses that so a plain-HTTP host is reachable
 (HTTPS is still recommended).
 
-## Build from source / self-host
+## Troubleshooting
 
-Everything below is optional — only needed to hack on it or ship your own build.
+**"blocked" / `NetworkError`, or nothing loads.** The extension can't reach your
+Hermes host. Open **Settings (⚙)**, confirm the **host** URL, click **Save host**,
+and **allow** Firefox's access prompt. Make sure Hermes is running and reachable
+from this machine (try opening the host URL in a normal tab). The status pill
+shows **blocked** in this state, with a link straight to Settings.
 
-```sh
-npm install        # or rely on npx
-npm run lint       # web-ext lint
-npm start          # run in a scratch Firefox profile (auto-reload)
-npm run build      # unsigned .zip in web-ext-artifacts/  (temporary loads only)
-npm run sign       # AMO-signed .xpi (needs WEB_EXT_API_KEY / WEB_EXT_API_SECRET)
-```
+**"signed out."** You're reaching the host but aren't logged in. Open your Hermes
+dashboard in the same Firefox, sign in, and the sidebar reconnects (or reopen it).
 
-Load an unsigned build via `about:debugging#/runtime/this-firefox` → **Load
-Temporary Add-on…** (it unloads on restart — release Firefox only keeps *signed*
-add-ons permanently).
+**A "Grant access to Hermes" button appears.** Firefox hasn't granted the
+extension access to your host yet — click it (or set the host in Settings, which
+asks for access). The status message may say access "was not granted" only if you
+dismiss that prompt.
 
-**Signing** uses a free [addons.mozilla.org](https://addons.mozilla.org) API key
-([create one](https://addons.mozilla.org/developers/addon/api/key/)) on the
-*unlisted* channel — no public listing or review wait.
+**Changed the host but it didn't switch.** Saving a new host reconnects
+automatically; if a stale view lingers, pick a session from the dropdown or reopen
+the sidebar.
 
-**Releases** are cut from git tags and signed by CI:
+**Docked from the pop-out window and the pane didn't reappear.** Firefox doesn't
+let a popup reopen a sidebar — reopen it with the toolbar icon or **Ctrl+Shift+Y**
+(your chat is preserved).
 
-1. Bump `version` in both `manifest.json` and `package.json` to the same value.
-2. Commit, then create a GitHub Release with tag `vX.Y.Z` (must match the version
-   — CI enforces it).
-3. The [`release`](./.github/workflows/release.yml) workflow lints, signs (when
-   the repo has `WEB_EXT_API_KEY` / `WEB_EXT_API_SECRET` secrets), regenerates the
-   `updates.json` auto-update manifest, and attaches the `.xpi` + `updates.json`
-   to the release.
+**Switched away mid-reply and the message looks cut off.** It's still buffering in
+the background; the full text is there when the turn finishes. Reselecting the
+session reloads it complete.
 
-> **Forking?** The signed build and auto-update feed are tied to this repo's
-> extension id and `browser_specific_settings.gecko.update_url`. For your own
-> distribution, change the `gecko.id` and `update_url` in `manifest.json` to your
-> fork, and sign under your own AMO account.
+**No badge / notification for other sessions.** Check **Settings → Notifications**
+(toolbar badge, dropdown highlight, "response waiting" note, desktop notification
+are each toggleable), and that Firefox/your OS allows notifications. Note that
+alerts only fire while a chat view is open.
+
+**Not updating.** Force a check at `about:addons` → gear → **Check for Updates**.
+The installed build must be a signed release for auto-updates to apply.
 
 ## Project layout
 

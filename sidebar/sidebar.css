@@ -35,6 +35,14 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .bar-right { display: flex; align-items: center; gap: 8px; }
 .bar-btn { padding: 2px 8px; font-size: 15px; line-height: 1; }
 
+/* "another session has a reply waiting" indicator next to the status pill */
+.waiting {
+  display: inline-flex; align-items: center; white-space: nowrap;
+  font-size: 10px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+  color: #ff6b6b;
+}
+.waiting[hidden] { display: none; }
+
 .status { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--hairline); }
 .status--ok      { color: #7ee081; border-color: color-mix(in srgb, #7ee081 40%, transparent); }
 .status--off     { color: #ff8f6b; border-color: color-mix(in srgb, #ff8f6b 40%, transparent); }
@@ -50,6 +58,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
   border: 1px solid var(--hairline); border-radius: 8px;
 }
 .session-select:focus { outline: none; border-color: var(--midground); }
+/* Highlighted when another session has an unread reply. */
+.session-select.has-unread {
+  border-color: #ff6b6b;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #ff6b6b 55%, transparent);
+}
 
 .log { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
 

@@ -19,6 +19,10 @@ globalThis.HERMES = {
     login: "/auth/password-login",       // cookie login
   },
 
+  // Per-surface notification toggles (settings.notify). All default on.
+  NOTIFY_DEFAULTS: { badge: true, dropdown: true, pill: true, system: true },
+  notifyConfig(settings) { return { ...this.NOTIFY_DEFAULTS, ...(settings?.notify || {}) }; },
+
   normHost(host) { return String(host || "").replace(/\/+$/, ""); },
   // ws://host/api/ws (or wss:// for an https host) — the JSON-RPC socket.
   wsUrl(host) { return this.normHost(host).replace(/^http/i, "ws") + "/api/ws"; },
