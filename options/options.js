@@ -38,16 +38,21 @@ async function saveHost() {
     hostSaved.style.color = "#ff8f6b";
     return;
   }
-  // Request access to the host so the extension may talk to it (needs a gesture,
-  // which this click provides). Grant is optional but the plugin can't reach the
-  // host without it.
-  let granted = true;
-  try { granted = await browser.permissions.request({ origins: [originPattern(host)] }); }
-  catch { granted = false; }
+  // Ask for host access (must run in this click's gesture). This can return false
+  // when nothing NEW was granted — e.g. access was already granted earlier — so
+  // it isn't a reliable success signal on its own.
+  const origins = [originPattern(host)];
+  try { await browser.permissions.request({ origins }); } catch {}
+
+  // Source of truth: do we actually have access now?
+  let granted = false;
+  try { granted = await browser.permissions.contains({ origins }); } catch {}
 
   await patchSettings({ host });
-  hostSaved.style.color = "";
-  hostSaved.textContent = granted ? "Saved." : "Saved — but host access was not granted.";
+  hostSaved.style.color = granted ? "" : "#ff8f6b";
+  hostSaved.textContent = granted
+    ? "Saved."
+    : "Saved — grant host access when Firefox prompts, or the plugin can't reach it.";
   setTimeout(() => { hostSaved.textContent = ""; }, 2500);
 }
 
