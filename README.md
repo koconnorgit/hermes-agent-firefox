@@ -61,6 +61,11 @@ via [addons.mozilla.org](https://addons.mozilla.org) on the *unlisted* channel
 Releases here also attach a signed `.xpi` automatically when repo AMO secrets are
 set (see below) — grab it from the [Releases](../../releases) page.
 
+**Auto-updates:** the manifest's `update_url` points at
+`releases/latest/download/updates.json`. Each signed release publishes that file
+(pointing to the release's `.xpi` with its hash), so once you install a signed
+build, Firefox auto-updates it from future releases — no reinstalling.
+
 ### Temporary (development)
 
 `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → pick

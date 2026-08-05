@@ -38,6 +38,7 @@ jobs:
         run: npm run lint
 
       - name: Build or sign
+        id: pack
         env:
           WEB_EXT_API_KEY: ${{ secrets.WEB_EXT_API_KEY }}
           WEB_EXT_API_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
@@ -45,10 +46,23 @@ jobs:
           if [ -n "$WEB_EXT_API_KEY" ] && [ -n "$WEB_EXT_API_SECRET" ]; then
             echo "AMO credentials present — signing (unlisted)…"
             npm run sign
+            echo "signed=true" >> "$GITHUB_OUTPUT"
           else
             echo "No AMO credentials — building an unsigned .zip…"
             npm run build
+            echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # Signed releases get a predictably-named .xpi and an updates.json so
+      # installed copies auto-update (manifest update_url → this release's asset).
+      - name: Build update manifest
+        if: steps.pack.outputs.signed == 'true' && github.event_name == 'release'
+        run: |
+          ver="$(node -p "require('./manifest.json').version")"
+          xpi="$(ls web-ext-artifacts/*.xpi | head -1)"
+          dest="web-ext-artifacts/hermes-agent-firefox-$ver.xpi"
+          [ "$xpi" != "$dest" ] && mv "$xpi" "$dest"
+          node scripts/make-updates.mjs "$dest" "${{ github.repository }}" "${{ github.event.release.tag_name }}" web-ext-artifacts/updates.json
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
