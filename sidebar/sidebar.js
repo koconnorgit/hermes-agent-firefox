@@ -109,12 +109,18 @@ async function checkAuth() {
 
   if (res.error) {
     setStatus("off", "blocked");
-    addMsg(
+    const note = addMsg(
       "system",
       `Background request to ${HOST} threw: ${res.error}\n` +
-      `If this still says NetworkError, the HTTP origin itself is being refused — ` +
-      `tell me and we'll look at serving Hermes over HTTPS or a local proxy.`
+      `Be sure to configure your Hermes host in `
     );
+    const link = document.createElement("a");
+    link.textContent = "Settings";
+    link.href = "#";
+    link.style.color = "var(--midground)";
+    link.addEventListener("click", (e) => { e.preventDefault(); browser.runtime.openOptionsPage(); });
+    note.appendChild(link);
+    note.appendChild(document.createTextNode("."));
     return false;
   }
 
@@ -531,6 +537,27 @@ el.sessionRefresh.addEventListener("click", loadSessions);
 el.settings.addEventListener("click", () => browser.runtime.openOptionsPage());
 setupPopButton();
 browser.windows.getCurrent().then((w) => { myWindowId = w.id; }).catch(() => {});
+
+// When the host changes in Settings, re-point and reconnect automatically so the
+// user doesn't have to close and reopen the sidebar. (The background resets its
+// socket on the same event — see background.js.)
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.settings) return;
+  const newHost = changes.settings.newValue?.host || DEFAULT_HOST;
+  if (newHost === HOST) return;
+  HOST = newHost;
+  reconnect();
+});
+
+async function reconnect() {
+  el.log.innerHTML = "";
+  setStatus("unknown", "reconnecting…");
+  const ok = await checkAuth();
+  if (ok) {
+    connectGateway().postMessage({ type: "resumeActive" });
+    loadSessions();
+  }
+}
 
 (async () => {
   // Context-menu "fresh open" → ask for a NEW session. Otherwise re-attach to the

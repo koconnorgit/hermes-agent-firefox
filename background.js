@@ -43,7 +43,11 @@ browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.settings) {
     const s = changes.settings.newValue || {};
     defaultView = s.defaultView || "sidebar";
-    HOST = s.host || DEFAULT_HOST;
+    const newHost = s.host || DEFAULT_HOST;
+    if (newHost !== HOST) {
+      HOST = newHost;
+      gateway.reset();   // drop the socket/sessions bound to the old host
+    }
     settingsLoaded = true;
   }
 });
@@ -244,6 +248,17 @@ class Gateway {
     });
   }
   _failAll(err) { for (const { reject, timer } of this.pending.values()) { clearTimeout(timer); try { reject(err); } catch {} } this.pending.clear(); }
+
+  // Tear down the connection + buffered sessions (e.g. the host changed). The
+  // next view/resumeActive reconnects to the new host with a fresh session.
+  reset() {
+    try { this.ws?.close(1000, "host changed"); } catch {}
+    this.ws = null; this.state = "idle"; this.connecting = null;
+    this._failAll(new Error("host changed"));
+    this.sessions.clear();
+    this.liveToStored.clear();
+    this.active = null;
+  }
 
   _onFrame(text) {
     let frame; try { frame = JSON.parse(text); } catch { return; }
