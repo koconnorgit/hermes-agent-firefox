@@ -47,6 +47,8 @@ browser.storage.onChanged.addListener((changes, area) => {
     defaultView = s.defaultView || "sidebar";
     notifyCfg = globalThis.HERMES.notifyConfig(s);
     gateway.updateBadge();   // reflect a toggled badge setting right away
+    gateway._ensureAlarm();  // start/stop background monitoring per the setting
+    gateway.keepalive();     // reconnect immediately if it was just turned on
     const newHost = s.host || DEFAULT_HOST;
     if (newHost !== HOST) {
       HOST = newHost;
@@ -207,6 +209,32 @@ class Gateway {
     this.sessions = new Map();      // storedId → { storedId, liveId, log:[], busy, unread, seeded }
     this.liveToStored = new Map();  // liveId → storedId
     this.active = null;             // storedId currently viewed
+    this.watched = new Set();       // storedIds to keep alive so closed-UI alerts fire
+  }
+
+  // ── background monitoring (alerts while all views are closed) ──
+  async _track(storedId) {
+    if (!storedId || this.watched.has(storedId)) return;
+    this.watched.add(storedId);
+    while (this.watched.size > 10) this.watched.delete(this.watched.values().next().value); // keep newest, under server cap
+    await browser.storage.session.set({ watchedSessions: [...this.watched] }).catch(() => {});
+    this._ensureAlarm();
+  }
+  _ensureAlarm() {
+    // A ~25s alarm both keeps the event page (and its socket) from idling out and
+    // re-establishes the connection if Firefox suspended us anyway.
+    if (notifyCfg.background) browser.alarms.create("hermes-keepalive", { periodInMinutes: 0.4 });
+    else browser.alarms.clear("hermes-keepalive");
+  }
+  async keepalive() {
+    if (!notifyCfg.background) { browser.alarms.clear("hermes-keepalive"); return; }
+    const { watchedSessions = [] } = await browser.storage.session.get("watchedSessions");
+    if (!watchedSessions.length) return;
+    try { await this.ensureSocket(); } catch { return; }
+    for (const sid of watchedSessions) {
+      const s = this._session(sid);
+      if (!s.liveId) { try { await this.openSession(sid); } catch {} }
+    }
   }
 
   addPort(port) { this.ports.add(port); port.onDisconnect.addListener(() => this.ports.delete(port)); }
@@ -291,6 +319,7 @@ class Gateway {
     const s = this._session(storedId);
     s.liveId = liveId; s.seeded = true;                // brand new → empty transcript
     if (liveId) this.liveToStored.set(liveId, storedId);
+    this._track(storedId);
     return s;
   }
 
@@ -303,6 +332,7 @@ class Gateway {
       if (s.liveId) this.liveToStored.set(s.liveId, storedId);
     }
     if (!s.seeded) { await this._seed(s); s.seeded = true; }
+    this._track(storedId);
     return s;
   }
 
@@ -395,12 +425,16 @@ class Gateway {
   }
   _setBusy(s, busy) { if (s.busy !== busy) { s.busy = busy; this._activity(s); } }
   _activity(s) { this.broadcast({ type: "activity", storedId: s.storedId, busy: s.busy, unread: s.unread }); }
+  // Alert when the reply isn't the session you're actively looking at — which
+  // includes the case where NO view is open (ports empty), so a reply to the
+  // last-viewed session still notifies.
+  _shouldAlert(s) { return this.ports.size === 0 || !this._isActive(s); }
   _completed(s) {
-    if (!this._isActive(s)) { s.unread = true; this._activity(s); this._notify(s); }
+    if (this._shouldAlert(s)) { s.unread = true; this._activity(s); this._notify(s); }
     this.updateBadge();
   }
   _needsInput(s) {   // the agent is blocked waiting for an answer
-    if (!this._isActive(s)) { s.unread = true; this._activity(s); this._notify(s, "Hermes needs your input."); }
+    if (this._shouldAlert(s)) { s.unread = true; this._activity(s); this._notify(s, "Hermes needs your input."); }
     this.updateBadge();
   }
   _notify(s, message = "New reply in another session.") {
@@ -449,6 +483,14 @@ class Gateway {
 }
 
 const gateway = new Gateway();
+
+// Keepalive: the alarm fires even with no view open, keeping the socket connected
+// (and reconnecting after a suspend) so replies still raise alerts.
+browser.alarms.onAlarm.addListener((a) => { if (a.name === "hermes-keepalive") gateway.keepalive(); });
+(async () => {
+  const { watchedSessions = [] } = await browser.storage.session.get("watchedSessions");
+  if (watchedSessions.length) { gateway._ensureAlarm(); gateway.keepalive(); }
+})();
 
 browser.runtime.onConnect.addListener((port) => {
   if (port.name !== "hermes:gateway") return;

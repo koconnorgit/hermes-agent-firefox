@@ -14,6 +14,7 @@ const notifyBoxes = {
   dropdown: document.getElementById("n-dropdown"),
   pill: document.getElementById("n-pill"),
   system: document.getElementById("n-system"),
+  background: document.getElementById("n-background"),
 };
 const notifySaved = document.getElementById("notify-saved");
 

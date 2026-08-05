@@ -20,7 +20,9 @@ globalThis.HERMES = {
   },
 
   // Per-surface notification toggles (settings.notify). All default on.
-  NOTIFY_DEFAULTS: { badge: true, dropdown: true, pill: true, system: true },
+  // `background`: keep a connection alive while all views are closed so replies
+  // still alert. The others gate individual on-screen/desktop signals.
+  NOTIFY_DEFAULTS: { badge: true, dropdown: true, pill: true, system: true, background: true },
   notifyConfig(settings) { return { ...this.NOTIFY_DEFAULTS, ...(settings?.notify || {}) }; },
 
   normHost(host) { return String(host || "").replace(/\/+$/, ""); },

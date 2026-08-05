@@ -81,9 +81,11 @@ the background; the full text is there when the turn finishes. Reselecting the
 session reloads it complete.
 
 **No badge / notification for other sessions.** Check **Settings → Notifications**
-(toolbar badge, dropdown highlight, "response waiting" note, desktop notification
-are each toggleable), and that Firefox/your OS allows notifications. Note that
-alerts only fire while a chat view is open.
+(toolbar badge, dropdown highlight, "response waiting" note, and desktop
+notification are each toggleable), and that Firefox/your OS allows notifications.
+To get alerts when the sidebar/window is **closed**, keep **"Alert while closed"**
+on — it holds a light background connection so replies still notify (turn it off
+to avoid any background network use).
 
 **Not updating.** Force a check at `about:addons` → gear → **Check for Updates**.
 The installed build must be a signed release for auto-updates to apply.

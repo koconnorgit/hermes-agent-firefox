@@ -1,6 +1,6 @@
 {
   "name": "hermes-agent-firefox",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Firefox extension to chat with a self-hosted Nous Research Hermes agent — sidebar/popout chat, multi-session buffering, page context, and interactive approvals.",
   "private": true,
   "license": "MIT",
