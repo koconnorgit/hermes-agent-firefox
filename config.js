@@ -30,5 +30,17 @@ globalThis.HERMES = {
   // ws://host/api/ws (or wss:// for an https host) — the JSON-RPC socket.
   wsUrl(host) { return this.normHost(host).replace(/^http/i, "ws") + "/api/ws"; },
   // Match pattern for host_permissions / permissions.request.
-  originPattern(host) { return this.normHost(host) + "/*"; },
+  // Firefox match patterns must NOT contain a port — "http://host:9119/*" is an
+  // invalid pattern that permissions.request()/contains() silently reject, so the
+  // grant prompt never shows and access is never obtained (see Firefox bug 1362809).
+  // Drop the port; a portless pattern matches the host on every port.
+  originPattern(host) {
+    const h = this.normHost(host);
+    try {
+      const u = new URL(h);
+      return `${u.protocol}//${u.hostname}/*`;
+    } catch {
+      return h.replace(/:\d+$/, "") + "/*";
+    }
+  },
 };

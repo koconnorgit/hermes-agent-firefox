@@ -62,11 +62,13 @@ async function saveHost() {
   // when nothing NEW was granted — e.g. access was already granted earlier — so
   // it isn't a reliable success signal on its own.
   const origins = [originPattern(host)];
-  try { await browser.permissions.request({ origins }); } catch {}
+  try { await browser.permissions.request({ origins }); }
+  catch (e) { console.warn("[hermes] permissions.request failed:", e); }
 
   // Source of truth: do we actually have access now?
   let granted = false;
-  try { granted = await browser.permissions.contains({ origins }); } catch {}
+  try { granted = await browser.permissions.contains({ origins }); }
+  catch (e) { console.warn("[hermes] permissions.contains failed:", e); }
 
   await patchSettings({ host });
   hostSaved.style.color = granted ? "" : "#ff8f6b";
