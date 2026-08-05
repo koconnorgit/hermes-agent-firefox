@@ -263,8 +263,7 @@ class Gateway {
       ws.onerror = () => { clearTimeout(to); reject(new Error("ws connect failed")); };
       ws.onclose = (ev) => {
         this.state = "closed"; this.ws = null;
-        this.liveToStored.clear();
-        for (const s of this.sessions.values()) s.liveId = null;  // must re-resume after reconnect
+        this._onSocketLost();
         this._failAll(new Error(`ws closed (${ev.code})`));
         this.broadcast({ type: "closed", code: ev.code, reason: ev.reason });
       };
@@ -282,6 +281,22 @@ class Gateway {
     });
   }
   _failAll(err) { for (const { reject, timer } of this.pending.values()) { clearTimeout(timer); try { reject(err); } catch {} } this.pending.clear(); }
+
+  // The socket died. Every buffer may now be missing a turn, so mark them for a
+  // re-pull and drop the busy flags — a session left "working…" on a dead socket
+  // never clears (nothing is left to deliver the completion) and locks its
+  // composer. If a turn really is still running, the next session.info heartbeat
+  // after the reconnect re-arms busy.
+  _onSocketLost() {
+    this.liveToStored.clear();
+    for (const s of this.sessions.values()) {
+      s.liveId = null;                        // must re-resume after reconnect
+      s.gap = true;
+      const closed = this._settle(s);
+      if (s.busy) { s.busy = false; this._activity(s); }
+      else if (closed) this._activity(s);
+    }
+  }
 
   // Tear down the connection + buffered sessions (e.g. the host changed). The
   // next view/resumeActive reconnects to the new host with a fresh session.
@@ -309,7 +324,7 @@ class Gateway {
   // ── sessions ──
   _session(storedId) {
     let s = this.sessions.get(storedId);
-    if (!s) { s = { storedId, liveId: null, log: [], busy: false, unread: false, seeded: false }; this.sessions.set(storedId, s); }
+    if (!s) { s = { storedId, fetchId: storedId, liveId: null, log: [], busy: false, unread: false, seeded: false, gap: false }; this.sessions.set(storedId, s); }
     return s;
   }
 
@@ -332,36 +347,107 @@ class Gateway {
       const res = await this.request("session.resume", { session_id: storedId, omit_messages: true });
       s.liveId = res?.session_id || null;
       if (s.liveId) this.liveToStored.set(s.liveId, storedId);
+      // Auto-compression ends a session and forks a continuation, so the server
+      // can bind the resume to a DIFFERENT stored id than the one we asked for.
+      // The transcript then lives under that id — read history from it, or the
+      // post-compression replies are simply missing.
+      if (res?.stored_session_id && res.stored_session_id !== s.fetchId) { s.fetchId = res.stored_session_id; s.gap = true; }
+      // The resume payload states whether a turn is in flight, so a session the
+      // terminal is mid-reply on shows as working the moment we attach.
+      if (typeof res?.running === "boolean") this._setBusy(s, res.running);
     }
     if (!s.seeded) { await this._seed(s); s.seeded = true; }
+    if (s.gap) await this._resync(s);
     this._track(storedId);
     return s;
   }
 
-  async _seed(s) {
+  // The persisted transcript, as log items. null if the fetch failed (so the
+  // caller keeps whatever it already has rather than blanking the view).
+  async _fetchHistory(s) {
     try {
-      const r = await fetch(`${HOST}/api/sessions/${encodeURIComponent(s.storedId)}/messages`, { credentials: "include" });
+      const r = await fetch(`${HOST}/api/sessions/${encodeURIComponent(s.fetchId)}/messages`, { credentials: "include" });
+      if (!r.ok) return null;
       const data = await r.json().catch(() => null);
+      if (!data) return null;
       const items = [];
-      for (const m of (data?.messages || [])) {
+      for (const m of (data.messages || [])) {
         if (m.role === "user" && m.content) items.push({ kind: "user", text: m.content });
         else if (m.role === "assistant") {
           if (m.content) items.push({ kind: "assistant", text: m.content });
           for (const tc of (m.tool_calls || [])) items.push({ kind: "tool", name: tc.function?.name || tc.name || "tool", done: true });
         }
       }
-      s.log = items.concat(s.log);                     // history precedes anything already buffered
-    } catch {}
+      return items;
+    } catch { return null; }
+  }
+
+  async _seed(s) {
+    const items = await this._fetchHistory(s);
+    if (!items) return;
+    s.log = items.concat(s.log);                       // history precedes anything already buffered
+    s.gap = false;
+  }
+
+  // Rebuild the buffer from the stored transcript. Used whenever our event
+  // stream has a hole — a dropped socket, a turn that ended with nothing
+  // streamed into us — since the server's copy is the one that's complete.
+  async _resync(s) {
+    if (s.syncing) return s.syncing;
+    s.syncing = (async () => {
+      try { await this._doResync(s); } finally { s.syncing = null; }
+    })();
+    return s.syncing;
+  }
+  async _doResync(s) {
+    const items = await this._fetchHistory(s);
+    if (!items) return;
+    const pending = s.log.filter((it) => it.kind === "request" && !it.resolved);  // keep live prompts
+    s.log = items.concat(pending);
+    s.gap = false;
+    s.seeded = true;
+    if (this._isActive(s)) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
+  }
+  async resync(storedId) {
+    const s = this.sessions.get(storedId);
+    if (!s) return this.view(storedId);
+    if (!s.liveId) { try { await this.openSession(storedId); } catch {} }
+    return this._resync(s);
   }
 
   // ── incoming events → per-session log ──
+  // Which buffered session an event belongs to. Events are tagged with the LIVE
+  // id, but a reconnect (or a session we only ever saw over REST) can leave that
+  // id unmapped — fall back to the stored id the payload carries and learn the
+  // mapping, rather than dropping the event on the floor.
+  _route(ev) {
+    const p = ev.payload || {};
+    const live = ev.session_id;
+    let storedId = live ? this.liveToStored.get(live) : null;
+    if (!storedId && live && this.sessions.has(live)) storedId = live;
+    if (!storedId && p.stored_session_id && this.sessions.has(p.stored_session_id)) storedId = p.stored_session_id;
+    if (storedId && live) this.liveToStored.set(live, storedId);
+    return storedId;
+  }
+
   _onEvent(ev) {
     if (ev.type === "sessions.changed") { this.broadcast({ type: "sessions-changed" }); this._scheduleNewSessionCheck(); return; }
-    const storedId = ev.session_id ? this.liveToStored.get(ev.session_id) : null;
+    const storedId = this._route(ev);
     if (!storedId) return;
     const s = this._session(storedId);
     const p = ev.payload || {};
     switch (ev.type) {
+      // The agent loop's own heartbeat. `running` is authoritative — and it's
+      // the ONLY end-of-turn signal we get when message.complete never arrives
+      // (turn crash, or a reconnect that straddled the completion). Without it a
+      // session sits at "working…" forever with the reply stranded server-side.
+      case "session.info":
+        if (typeof p.running === "boolean") {
+          if (!p.running) { if (this._settle(s)) this._completed(s); }
+          this._setBusy(s, p.running);
+          if (!p.running && s.gap) this._resync(s);
+        }
+        break;
       case "message.start": this._push(s, { kind: "assistant", text: "", streaming: true }); this._setBusy(s, true); break;
       case "message.delta": if (typeof p.text === "string") this._appendAssistant(s, p.text); break;
       case "message.complete": this._endAssistant(s, p.text); this._setBusy(s, false); this._completed(s); break;
@@ -411,13 +497,36 @@ class Gateway {
     if (last && last.kind === "assistant" && last.streaming) { last.text += text; this._emit(s, { op: "delta", text }); }
     else this._push(s, { kind: "assistant", text, streaming: true });
   }
+  // Close out the turn's bubble. Scans back for the streaming item rather than
+  // trusting the tail — a tool.start between the deltas and the completion puts
+  // a tool item last, which used to swallow the whole reply.
   _endAssistant(s, finalText) {
-    const last = s.log[s.log.length - 1];
-    if (last && last.kind === "assistant" && last.streaming) {
-      if (!last.text && typeof finalText === "string") last.text = finalText;
-      last.streaming = false;
-      this._emit(s, { op: "end", text: last.text });
+    for (let i = s.log.length - 1; i >= 0; i--) {
+      const it = s.log[i];
+      if (it.kind === "assistant" && it.streaming) {
+        // Prefer the completion's text: if we missed deltas, ours is truncated.
+        if (typeof finalText === "string" && finalText.length > it.text.length) it.text = finalText;
+        it.streaming = false;
+        this._emit(s, { op: "end", text: it.text });
+        return;
+      }
     }
+    // No open bubble — we joined mid-turn, or missed message.start entirely.
+    if (typeof finalText === "string" && finalText) this._push(s, { kind: "assistant", text: finalText });
+    else s.gap = true;
+  }
+  // Un-stream a bubble nothing ever closed. True if it actually closed one.
+  _settle(s) {
+    for (let i = s.log.length - 1; i >= 0; i--) {
+      const it = s.log[i];
+      if (it.kind === "assistant" && it.streaming) {
+        it.streaming = false;
+        if (!it.text) s.gap = true;          // turn produced text we never saw → REST has it
+        this._emit(s, { op: "end", text: it.text });
+        return true;
+      }
+    }
+    return false;
   }
   _toolDone(s, name) {
     for (let i = s.log.length - 1; i >= 0; i--) {
@@ -547,6 +656,7 @@ browser.runtime.onConnect.addListener((port) => {
       else if (m?.type === "view") await gateway.view(m.storedId);
       else if (m?.type === "new") await gateway.viewNew();
       else if (m?.type === "prompt") await gateway.submit(m.text, m.display);
+      else if (m?.type === "resync" && m.storedId) await gateway.resync(m.storedId);
       else if (m?.type === "respond") await gateway.respond(m);
       else if (m?.type === "markRead" && m.storedId) {
         const s = gateway.sessions.get(m.storedId);

@@ -150,16 +150,32 @@ let streamBubble = null;       // current streaming assistant bubble
 let lastToolBubble = null;     // most recent "running tool" note
 const sessionMeta = new Map(); // storedId → { busy, unread } for dropdown markers
 
+let reconnectTimer = null;
+let reconnectTries = 0;
+
 function connectGateway() {
   if (gatewayPort) return gatewayPort;
   const port = browser.runtime.connect({ name: "hermes:gateway" });
   gatewayPort = port;
   port.onMessage.addListener(onGatewayMessage);
-  port.onDisconnect.addListener(() => { gatewayPort = null; });
+  port.onDisconnect.addListener(() => {
+    gatewayPort = null;
+    // The background page can be torn down (idle suspend, extension reload)
+    // while this view is still open. Without a reconnect the pane goes deaf and
+    // freezes on whatever it last painted — typically "working…" with the
+    // composer locked, while the reply lands fine on the server.
+    clearTimeout(reconnectTimer);
+    const delay = Math.min(30000, 1000 * 2 ** reconnectTries++);
+    setStatus("unknown", "reconnecting…");
+    reconnectTimer = setTimeout(() => {
+      try { connectGateway().postMessage({ type: "resumeActive" }); } catch {}
+    }, delay);
+  });
   return port;
 }
 
 function onGatewayMessage(m) {
+  reconnectTries = 0;          // the port is alive again
   switch (m.type) {
     case "log":        renderLog(m.storedId, m.items, m.busy); break;
     case "render":     if (m.storedId === viewingStoredId) applyRenderOp(m); break;
@@ -168,6 +184,7 @@ function onGatewayMessage(m) {
     case "sessions-changed": scheduleSessionsReload(); break;
     case "closed":
       setStatus("off", "disconnected");
+      el.send.disabled = false;   // never strand the composer on a dead socket
       if (streamBubble) { streamBubble.classList.remove("streaming"); streamBubble = null; }
       if (m.code && m.code !== 1000) addMsg("system", `Gateway closed (code ${m.code}${m.reason ? ": " + m.reason : ""}).`);
       break;
@@ -323,7 +340,9 @@ function applyRenderOp(m) {
       break;
     case "end":
       if (streamBubble) {
-        if (!streamBubble.textContent && typeof m.text === "string") streamBubble.textContent = m.text;
+        // m.text is the background's full buffered text — authoritative, since
+        // any delta we missed leaves what's on screen truncated.
+        if (typeof m.text === "string" && m.text.length > streamBubble.textContent.length) streamBubble.textContent = m.text;
         streamBubble.classList.remove("streaming"); streamBubble = null;
       }
       break;
@@ -546,7 +565,12 @@ el.sessionSelect.addEventListener("change", () => {
   const v = el.sessionSelect.value;
   if (v) selectSession(v); else newChat();
 });
-el.sessionRefresh.addEventListener("click", loadSessions);
+el.sessionRefresh.addEventListener("click", () => {
+  loadSessions();
+  // Manual escape hatch: re-pull the open session's transcript from the server,
+  // so a reply that arrived while we were disconnected shows up on demand.
+  if (viewingStoredId) connectGateway().postMessage({ type: "resync", storedId: viewingStoredId });
+});
 el.settings.addEventListener("click", () => browser.runtime.openOptionsPage());
 setupPopButton();
 browser.windows.getCurrent().then((w) => { myWindowId = w.id; }).catch(() => {});

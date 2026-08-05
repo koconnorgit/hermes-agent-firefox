@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Hermes Agent",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Chat with the Nous Research Hermes agent, send page context, and fire quick tasks — from a Firefox sidebar.",
 
   "browser_specific_settings": {
