@@ -329,6 +329,21 @@ function renderLog(storedId, items, busy) {
   el.send.disabled = !!busy;
 }
 
+// A stream op arrived with no bubble to put it in — the pane's view of the
+// stream and the background's buffer have diverged (a dropped socket nulls the
+// bubble, a re-render can land mid-turn). Guessing here is how a finished reply
+// ends up on screen truncated or missing until you refresh; ask the background
+// to re-send the buffer instead, since it holds the authoritative copy.
+let rerenderPending = false;
+function requestRerender() {
+  if (rerenderPending) return;
+  rerenderPending = true;
+  setTimeout(() => {
+    rerenderPending = false;
+    try { connectGateway().postMessage({ type: "rerender" }); } catch {}
+  }, 250);
+}
+
 function applyRenderOp(m) {
   switch (m.op) {
     case "push":
@@ -337,6 +352,7 @@ function applyRenderOp(m) {
       break;
     case "delta":
       if (streamBubble) { streamBubble.textContent += m.text; el.log.scrollTop = el.log.scrollHeight; }
+      else requestRerender();
       break;
     case "end":
       if (streamBubble) {
@@ -344,7 +360,7 @@ function applyRenderOp(m) {
         // any delta we missed leaves what's on screen truncated.
         if (typeof m.text === "string" && m.text.length > streamBubble.textContent.length) streamBubble.textContent = m.text;
         streamBubble.classList.remove("streaming"); streamBubble = null;
-      }
+      } else requestRerender();   // the completed reply would otherwise be dropped
       break;
     case "toolDone":
       if (lastToolBubble) { lastToolBubble.textContent = `✓ ${m.name || "tool"}`; lastToolBubble = null; }

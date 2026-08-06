@@ -20,6 +20,32 @@
 const { ENDPOINTS, DEFAULT_HOST } = globalThis.HERMES;
 let HOST = DEFAULT_HOST;  // live Hermes host; overridden from settings below
 
+// Gateway text payloads are not always plain strings: the agent can send an
+// array of content blocks ({text} / {output_text}) or a single block object.
+// A `typeof x === "string"` test drops those on the floor, which shows up as a
+// reply that streams in half — or never appears — while the server has it all.
+// Mirrors coerceGatewayText() in the reference client (hermes-agent
+// apps/desktop/src/lib/chat-runtime.ts).
+function txt(v) {
+  if (typeof v === "string") return v;
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.map(txt).join("");
+  if (typeof v === "object") {
+    if (typeof v.text === "string") return v.text;
+    if (typeof v.output_text === "string") return v.output_text;
+    return "";
+  }
+  return String(v);
+}
+// The trailing assistant text in a log, for comparing our buffer against the
+// server's stored transcript.
+function lastAssistantText(items) {
+  for (let i = (items || []).length - 1; i >= 0; i--) {
+    if (items[i].kind === "assistant") return items[i].text || "";
+  }
+  return "";
+}
+
 // ── Entry points: context menu, toolbar, sidebar plumbing ───────────────────
 const MENU = { SELECTION: "hermes-ask-selection", PAGE: "hermes-ask-page" };
 const HERMES_WINDOW_URL = browser.runtime.getURL("sidebar/sidebar.html?ctx=window");
@@ -211,6 +237,8 @@ class Gateway {
     this.active = null;             // storedId currently viewed
     this.watched = new Set();       // storedIds to keep alive so closed-UI alerts fire
     this._newSessTimer = null;      // debounce for new-session detection
+    this.lastFrameAt = 0;           // when the socket last delivered anything
+    this._probing = null;           // in-flight liveness probe
   }
 
   // ── background monitoring (alerts while all views are closed) ──
@@ -223,12 +251,65 @@ class Gateway {
   }
   _ensureAlarm() {
     // A ~25s alarm both keeps the event page (and its socket) from idling out and
-    // re-establishes the connection if Firefox suspended us anyway.
-    if (notifyCfg.background) browser.alarms.create("hermes-keepalive", { periodInMinutes: 0.4 });
+    // re-establishes the connection if Firefox suspended us anyway. It also
+    // drives the liveness watchdog, so it runs whenever a view is open or a turn
+    // is in flight — not only when background alerts are enabled.
+    const needed = notifyCfg.background || this.ports.size > 0 ||
+      [...this.sessions.values()].some((s) => s.busy);
+    if (needed) browser.alarms.create("hermes-keepalive", { periodInMinutes: 0.4 });
     else browser.alarms.clear("hermes-keepalive");
   }
+
+  // Fired by the keepalive alarm. Liveness first (it can force a reconnect),
+  // then the background-alert upkeep.
+  async tick() {
+    await this._checkLiveness();
+    if (notifyCfg.background) await this.keepalive();
+    // Background alerts are off, so keepalive() won't reconnect — but a view is
+    // open and its socket is gone. Re-attach, or the pane sits there deaf.
+    else if (this.ports.size > 0 && this.state !== "open") {
+      try { await this.resumeActive(); } catch {}
+    }
+  }
+
+  // A socket can die without ever firing onclose — a laptop sleep, a NAT or
+  // proxy idle timeout, a wifi flip. readyState still reads OPEN, no events
+  // arrive, and a turn sits at "working…" with its reply stranded on the
+  // server. Probe a quiet socket, and re-read the transcript for any session
+  // that's been busy with nothing coming in.
+  async _checkLiveness() {
+    const now = Date.now();
+    const busy = [...this.sessions.values()].filter((s) => s.busy);
+    const quiet = now - (this.lastFrameAt || 0);
+
+    if (this.ws?.readyState === WebSocket.OPEN && quiet > (busy.length ? 30000 : 90000) && !this._probing) {
+      const ws = this.ws;
+      this._probing = this.request("session.active_list", {}, 10000)
+        .then(() => { this.lastFrameAt = Date.now(); })
+        .catch(() => {
+          // Unresponsive: drop it so ensureSocket() builds a fresh one. The
+          // close may never arrive on a half-open socket, so settle by hand.
+          try { ws.close(4000, "heartbeat failed"); } catch {}
+          if (this.ws === ws) { this.ws = null; this.state = "closed"; this._onSocketLost(); }
+        })
+        .finally(() => { this._probing = null; });
+      await this._probing;
+    }
+
+    // Still nothing after the probe → trust the transcript over the stream. If
+    // it turns out the turn already produced its reply, settle the session:
+    // leaving it "working…" strands the composer on a turn that's long done.
+    if (busy.length && Date.now() - (this.lastFrameAt || 0) > 45000) {
+      for (const s of busy) {
+        const before = lastAssistantText(s.log);
+        await this._resync(s).catch(() => {});
+        if (lastAssistantText(s.log).length > before.length) { this._settle(s); this._setBusy(s, false); }
+      }
+    }
+  }
+
   async keepalive() {
-    if (!notifyCfg.background) { browser.alarms.clear("hermes-keepalive"); return; }
+    if (!notifyCfg.background) { this._ensureAlarm(); return; }
     // Hold the socket open even with nothing watched — a bare authed socket still
     // receives global sessions.changed, which is how we spot timer/cron sessions.
     try { await this.ensureSocket(); } catch { return; }
@@ -239,7 +320,11 @@ class Gateway {
     }
   }
 
-  addPort(port) { this.ports.add(port); port.onDisconnect.addListener(() => this.ports.delete(port)); }
+  addPort(port) {
+    this.ports.add(port);
+    this._ensureAlarm();
+    port.onDisconnect.addListener(() => { this.ports.delete(port); this._ensureAlarm(); });
+  }
   broadcast(msg) { for (const p of this.ports) { try { p.postMessage(msg); } catch {} } }
 
   // ── socket ──
@@ -259,22 +344,26 @@ class Gateway {
       try { ws = new WebSocket(`${globalThis.HERMES.wsUrl(HOST)}?ticket=${encodeURIComponent(ticket)}`); }
       catch (e) { return reject(e); }
       const to = setTimeout(() => { try { ws.close(); } catch {} reject(new Error("ws connect timeout")); }, 10000);
-      ws.onopen = () => { clearTimeout(to); this.ws = ws; this.state = "open"; resolve(); };
+      ws.onopen = () => { clearTimeout(to); this.ws = ws; this.state = "open"; this.lastFrameAt = Date.now(); resolve(); };
       ws.onerror = () => { clearTimeout(to); reject(new Error("ws connect failed")); };
       ws.onclose = (ev) => {
+        // A dead socket's close can land AFTER we've already replaced it (the
+        // liveness probe force-closes and reconnects). Without this guard the
+        // old socket's handler nulls the new one and the reconnect goes deaf.
+        if (this.ws && this.ws !== ws) return;
         this.state = "closed"; this.ws = null;
         this._onSocketLost();
         this._failAll(new Error(`ws closed (${ev.code})`));
         this.broadcast({ type: "closed", code: ev.code, reason: ev.reason });
       };
-      ws.onmessage = (e) => this._onFrame(e.data);
+      ws.onmessage = (e) => { if (this.ws === ws) this._onFrame(e.data); };
     });
   }
-  request(method, params = {}) {
+  request(method, params = {}, timeoutMs = 180000) {
     return new Promise((resolve, reject) => {
       if (this.ws?.readyState !== WebSocket.OPEN) return reject(new Error("gateway not connected"));
       const id = `w${++this.seq}`;
-      const timer = setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); reject(new Error(`request timed out: ${method}`)); } }, 180000);
+      const timer = setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); reject(new Error(`request timed out: ${method}`)); } }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try { this.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); }
       catch (e) { this.pending.delete(id); clearTimeout(timer); reject(e); }
@@ -293,8 +382,10 @@ class Gateway {
       s.liveId = null;                        // must re-resume after reconnect
       s.gap = true;
       const closed = this._settle(s);
-      if (s.busy) { s.busy = false; this._activity(s); }
-      else if (closed) this._activity(s);
+      // Through _setBusy so the end-of-turn reconciliation runs: whatever the
+      // turn produced after the socket died is only in the stored transcript.
+      if (s.busy) this._setBusy(s, false);
+      else if (closed) { this._activity(s); this._scheduleVerify(s); }
     }
   }
 
@@ -310,6 +401,7 @@ class Gateway {
   }
 
   _onFrame(text) {
+    this.lastFrameAt = Date.now();
     let frame; try { frame = JSON.parse(text); } catch { return; }
     if (frame.id != null && this.pending.has(frame.id)) {
       const { resolve, reject, timer } = this.pending.get(frame.id);
@@ -324,7 +416,7 @@ class Gateway {
   // ── sessions ──
   _session(storedId) {
     let s = this.sessions.get(storedId);
-    if (!s) { s = { storedId, fetchId: storedId, liveId: null, log: [], busy: false, unread: false, seeded: false, gap: false }; this.sessions.set(storedId, s); }
+    if (!s) { s = { storedId, fetchId: storedId, liveId: null, log: [], busy: false, unread: false, seeded: false, gap: false, announced: true, verifyTimer: null }; this.sessions.set(storedId, s); }
     return s;
   }
 
@@ -372,9 +464,10 @@ class Gateway {
       if (!data) return null;
       const items = [];
       for (const m of (data.messages || [])) {
-        if (m.role === "user" && m.content) items.push({ kind: "user", text: m.content });
+        const content = txt(m.content);
+        if (m.role === "user" && content) items.push({ kind: "user", text: content });
         else if (m.role === "assistant") {
-          if (m.content) items.push({ kind: "assistant", text: m.content });
+          if (content) items.push({ kind: "assistant", text: content });
           for (const tc of (m.tool_calls || [])) items.push({ kind: "tool", name: tc.function?.name || tc.name || "tool", done: true });
         }
       }
@@ -402,11 +495,22 @@ class Gateway {
   async _doResync(s) {
     const items = await this._fetchHistory(s);
     if (!items) return;
-    const pending = s.log.filter((it) => it.kind === "request" && !it.resolved);  // keep live prompts
-    s.log = items.concat(pending);
+    const before = lastAssistantText(s.log);
+    const fresh = lastAssistantText(items);
+    // Keep what the stored transcript can't have yet: unanswered prompts, and a
+    // reply still streaming into us (a resync mid-turn would otherwise wipe the
+    // bubble the user is watching fill in).
+    const keep = s.log.filter((it) =>
+      (it.kind === "request" && !it.resolved) ||
+      (it.kind === "assistant" && it.streaming && it.text && !fresh.includes(it.text)));
+    s.log = items.concat(keep);
     s.gap = false;
     s.seeded = true;
     if (this._isActive(s)) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
+    // We only learned about this reply by re-reading the transcript, so nothing
+    // announced it — raise the badge/notification now rather than leaving the
+    // turn silently finished.
+    if (fresh && fresh.length > before.length && !s.announced) this._completed(s);
   }
   async resync(storedId) {
     const s = this.sessions.get(storedId);
@@ -425,7 +529,10 @@ class Gateway {
     const live = ev.session_id;
     let storedId = live ? this.liveToStored.get(live) : null;
     if (!storedId && live && this.sessions.has(live)) storedId = live;
-    if (!storedId && p.stored_session_id && this.sessions.has(p.stored_session_id)) storedId = p.stored_session_id;
+    if (!storedId && p.stored_session_id &&
+        (this.sessions.has(p.stored_session_id) || this.watched.has(p.stored_session_id))) {
+      storedId = p.stored_session_id;   // ours, just not mapped yet (post-reconnect)
+    }
     if (storedId && live) this.liveToStored.set(live, storedId);
     return storedId;
   }
@@ -448,12 +555,21 @@ class Gateway {
           if (!p.running && s.gap) this._resync(s);
         }
         break;
-      case "message.start": this._push(s, { kind: "assistant", text: "", streaming: true }); this._setBusy(s, true); break;
-      case "message.delta": if (typeof p.text === "string") this._appendAssistant(s, p.text); break;
-      case "message.complete": this._endAssistant(s, p.text); this._setBusy(s, false); this._completed(s); break;
+      case "message.start": s.announced = false; this._push(s, { kind: "assistant", text: "", streaming: true }); this._setBusy(s, true); break;
+      case "message.delta": { const d = txt(p.text); if (d) this._appendAssistant(s, d); break; }
+      // Interim assistant commentary (text emitted alongside tool calls). Seal
+      // it as its own bubble so the final completion adds a new one instead of
+      // overwriting prose the user already read.
+      case "message.interim": this._sealInterim(s, txt(p.text)); break;
+      // payload.text is the whole final reply; `rendered` is the same text
+      // pre-wrapped for terminals and is all we get on some frames.
+      case "message.complete":
+        this._endAssistant(s, txt(p.text) || txt(p.rendered));
+        this._setBusy(s, false); this._completed(s); this._scheduleVerify(s);
+        break;
       case "tool.start": this._push(s, { kind: "tool", name: p.name || p.tool || "tool", done: false }); break;
       case "tool.complete": this._toolDone(s, p.name || p.tool); break;
-      case "error": this._push(s, { kind: "system", text: `⚠ ${p.message || p.text || "agent error"}` }); this._setBusy(s, false); break;
+      case "error": this._push(s, { kind: "system", text: `⚠ ${txt(p.message) || txt(p.text) || "agent error"}` }); this._setBusy(s, false); break;
       case "approval.request":
         this._push(s, { kind: "request", rtype: "approval", liveId: ev.session_id, command: p.command || "", choices: (p.choices && p.choices.length) ? p.choices : ["once", "deny"], resolved: false });
         this._needsInput(s); break;
@@ -511,9 +627,27 @@ class Gateway {
         return;
       }
     }
-    // No open bubble — we joined mid-turn, or missed message.start entirely.
-    if (typeof finalText === "string" && finalText) this._push(s, { kind: "assistant", text: finalText });
-    else s.gap = true;
+    // No open bubble — we joined mid-turn, missed message.start entirely, or an
+    // interim already sealed this turn's prose. Add the reply unless the tail
+    // already carries it (a completion that just restates a sealed interim).
+    if (finalText) {
+      if (lastAssistantText(s.log).includes(finalText)) return;
+      this._push(s, { kind: "assistant", text: finalText });
+    } else s.gap = true;
+  }
+  // An interim message means "this prose is final, more may follow". Close the
+  // open bubble on it so later deltas start a fresh one.
+  _sealInterim(s, text) {
+    if (!text) return;
+    for (let i = s.log.length - 1; i >= 0; i--) {
+      const it = s.log[i];
+      if (it.kind === "assistant" && it.streaming) {
+        if (text.length > it.text.length) it.text = text;
+        it.streaming = false;
+        this._emit(s, { op: "end", text: it.text });
+        return;
+      }
+    }
   }
   // Un-stream a bubble nothing ever closed. True if it actually closed one.
   _settle(s) {
@@ -534,13 +668,42 @@ class Gateway {
       if (it.kind === "tool" && !it.done) { it.done = true; if (name) it.name = name; this._emit(s, { op: "toolDone", name: it.name }); break; }
     }
   }
-  _setBusy(s, busy) { if (s.busy !== busy) { s.busy = busy; this._activity(s); } }
+  _setBusy(s, busy) {
+    if (s.busy === busy) return;
+    s.busy = busy;
+    if (busy) s.announced = false;
+    this._activity(s);
+    this._ensureAlarm();          // watchdog runs for the duration of a turn
+    if (!busy) this._scheduleVerify(s);
+  }
+
+  // ── end-of-turn reconciliation ──────────────────────────────────────────
+  // The event stream is best-effort: a suspended background page, a dropped or
+  // half-open socket, or a frame shape we didn't understand all end the same
+  // way — a reply that's complete on the server and truncated (or missing)
+  // here, with no notification. So after every turn settles, check our buffer
+  // against the stored transcript, which is the authoritative copy.
+  _scheduleVerify(s) {
+    clearTimeout(s.verifyTimer);
+    // Small delay: the transcript is persisted just after the turn ends, so an
+    // immediate read can still be a message behind.
+    s.verifyTimer = setTimeout(() => this._verifyTurn(s).catch(() => {}), 1500);
+  }
+  async _verifyTurn(s) {
+    if (s.busy) return;                       // a new turn is running; its own end verifies
+    const items = await this._fetchHistory(s);
+    if (!items) return;
+    // Only ever adopt MORE text — a transcript that lags behind must never
+    // shorten what we already showed.
+    if (lastAssistantText(items).length > lastAssistantText(s.log).length) await this._resync(s);
+  }
   _activity(s) { this.broadcast({ type: "activity", storedId: s.storedId, busy: s.busy, unread: s.unread }); }
   // Alert when the reply isn't the session you're actively looking at — which
   // includes the case where NO view is open (ports empty), so a reply to the
   // last-viewed session still notifies.
   _shouldAlert(s) { return this.ports.size === 0 || !this._isActive(s); }
   _completed(s) {
+    s.announced = true;
     if (this._shouldAlert(s)) { s.unread = true; this._activity(s); this._notify(s); }
     this.updateBadge();
   }
@@ -608,16 +771,30 @@ class Gateway {
   }
 
   // ── viewer actions ──
+  // Re-send the active session's buffer. No network — used when a view finds
+  // itself out of sync with the stream (see the sidebar's render ops).
+  rerender() {
+    const s = this.active ? this.sessions.get(this.active) : null;
+    if (s) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
+  }
+
+  _setActive(storedId) {
+    this.active = storedId;
+    // Persisted so a suspended/restarted background page comes back to the
+    // chat the user was in, instead of stranding it behind a brand-new session.
+    browser.storage.session.set({ activeSession: storedId }).catch(() => {});
+  }
+
   async view(storedId) {
     const s = await this.openSession(storedId);
-    this.active = storedId;
+    this._setActive(storedId);
     s.unread = false; this.updateBadge();
     this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
     return s;
   }
   async viewNew() {
     const s = await this.newSession();
-    this.active = s.storedId;
+    this._setActive(s.storedId);
     this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
     return s;
   }
@@ -625,6 +802,12 @@ class Gateway {
     // Sidebar (re)opened: re-attach to the active session, or make a fresh one.
     await this.ensureSocket();
     if (this.active && this.sessions.has(this.active)) return this.view(this.active);
+    // Nothing in memory — we may have been suspended mid-conversation. Restore
+    // the session that was open rather than silently starting over.
+    const { activeSession } = await browser.storage.session.get("activeSession").catch(() => ({}));
+    if (activeSession) {
+      try { return await this.view(activeSession); } catch {}
+    }
     return this.viewNew();
   }
 
@@ -633,7 +816,13 @@ class Gateway {
     const s = this._session(this.active);
     if (!s.liveId) await this.openSession(s.storedId);
     this._push(s, { kind: "user", text: display ?? text });
-    return this.request("prompt.submit", { session_id: s.liveId, text });
+    s.announced = false;
+    const res = await this.request("prompt.submit", { session_id: s.liveId, text });
+    // The gateway acks as soon as the turn is spawned. Mark the session busy on
+    // that ack rather than waiting for message.start, so the watchdog is armed
+    // even if the very first event of the turn is the one we lose.
+    this._setBusy(s, true);
+    return res;
   }
 }
 
@@ -641,7 +830,7 @@ const gateway = new Gateway();
 
 // Keepalive: the alarm fires even with no view open, keeping the socket connected
 // (and reconnecting after a suspend) so replies still raise alerts.
-browser.alarms.onAlarm.addListener((a) => { if (a.name === "hermes-keepalive") gateway.keepalive(); });
+browser.alarms.onAlarm.addListener((a) => { if (a.name === "hermes-keepalive") gateway.tick(); });
 (async () => {
   const { settings } = await browser.storage.local.get("settings");
   if (globalThis.HERMES.notifyConfig(settings).background) { gateway._ensureAlarm(); gateway.keepalive(); }
@@ -657,6 +846,7 @@ browser.runtime.onConnect.addListener((port) => {
       else if (m?.type === "new") await gateway.viewNew();
       else if (m?.type === "prompt") await gateway.submit(m.text, m.display);
       else if (m?.type === "resync" && m.storedId) await gateway.resync(m.storedId);
+      else if (m?.type === "rerender") gateway.rerender();
       else if (m?.type === "respond") await gateway.respond(m);
       else if (m?.type === "markRead" && m.storedId) {
         const s = gateway.sessions.get(m.storedId);
