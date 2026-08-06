@@ -111,6 +111,30 @@ body { display: flex; flex-direction: column; height: 100vh; }
   font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; line-height: 1.5;
 }
 
+.md blockquote {
+  padding-left: 10px; color: var(--muted);
+  border-left: 2px solid color-mix(in srgb, var(--midground) 55%, transparent);
+}
+
+/* Tables that fit the pane stay a grid. */
+.md .md-table-wrap { max-width: 100%; overflow-x: auto; }
+.md .md-table { border-collapse: collapse; font-size: 13px; }
+.md .md-table th, .md .md-table td {
+  padding: 4px 8px; text-align: left; vertical-align: top;
+  border: 1px solid var(--hairline);
+}
+.md .md-table th {
+  color: var(--midground); font-weight: 600;
+  background: color-mix(in srgb, var(--midground) 8%, transparent);
+}
+
+/* …and wide ones stack, one block per row with the column as the label —
+   the same fallback the Hermes TUI uses when a table outgrows the width. */
+.md .md-row + .md-row { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--hairline); }
+.md .md-field + .md-field { margin-top: 3px; }
+.md .md-key { font-weight: 600; color: var(--midground); }
+.md .md-heads { font-weight: 600; color: var(--midground); }
+
 /* Streaming caret — sits at the tail of the last block so it hugs the text
    instead of dropping onto a line of its own. */
 .md-caret {

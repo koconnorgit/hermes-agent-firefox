@@ -11,6 +11,18 @@
 // otherwise be one click from running in the extension's own page).
 globalThis.HERMES_MD = (() => {
 
+  // ── tables ────────────────────────────────────────────────────────────────
+  // GFM pipe tables: a row of cells, a divider row, then body rows. Detection
+  // and splitting match the Hermes TUI (ui-tui/src/components/markdown.tsx).
+  const DIVIDER_CELL = /^:?-{3,}:?$/;
+  const splitRow = (row) => row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  function isDivider(line) {
+    if (line == null) return false;
+    const cells = splitRow(line);
+    return cells.length > 1 && cells.every((c) => DIVIDER_CELL.test(c));
+  }
+  const startsTable = (lines, i) => lines[i].includes("|") && isDivider(lines[i + 1]);
+
   // ── blocks ────────────────────────────────────────────────────────────────
   function parseBlocks(text) {
     const lines = String(text ?? "").split("\n");
@@ -29,6 +41,20 @@ globalThis.HERMES_MD = (() => {
         while (i < lines.length && !lines[i].startsWith("```")) code.push(lines[i++]);
         i++;                                  // closing fence
         blocks.push({ type: "code", lang: fence[1] || "", content: code.join("\n") });
+        continue;
+      }
+
+      if (startsTable(lines, i)) {
+        const rows = [splitRow(line)];
+        for (i += 2; i < lines.length && lines[i].includes("|") && lines[i].trim(); i++) rows.push(splitRow(lines[i]));
+        blocks.push({ type: "table", rows });
+        continue;
+      }
+
+      if (/^>\s?/.test(line)) {
+        const quoted = [];
+        while (i < lines.length && /^>\s?/.test(lines[i])) quoted.push(lines[i++].replace(/^>\s?/, ""));
+        blocks.push({ type: "quote", content: quoted.join("\n") });
         continue;
       }
 
@@ -63,7 +89,8 @@ globalThis.HERMES_MD = (() => {
         i < lines.length && lines[i].trim() !== "" &&
         !/^```/.test(lines[i]) && !/^#{1,4}\s/.test(lines[i]) &&
         !/^[-*+]\s/.test(lines[i]) && !/^\d+[.)]\s/.test(lines[i]) &&
-        !/^[-*_]{3,}\s*$/.test(lines[i])
+        !/^[-*_]{3,}\s*$/.test(lines[i]) && !/^>\s?/.test(lines[i]) &&
+        !startsTable(lines, i)
       ) para.push(lines[i++]);
       if (para.length) blocks.push({ type: "paragraph", content: para.join("\n") });
     }
@@ -73,7 +100,11 @@ globalThis.HERMES_MD = (() => {
 
   // ── inline spans ──────────────────────────────────────────────────────────
   // Priority: code > link > bold > italic > bare URL > line break.
-  const INLINE = /(`[^`]+`)|(\[([^\]]+)\]\(([^)]+)\))|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(\bhttps?:\/\/[^\s<>)\]]+)|(\n)/g;
+  // The trailing `<br>` alternative is not markdown: it's how models write a
+  // line break inside a table cell (a real newline would end the row). It's
+  // matched as literal text and turned into a <br> element — the dashboard
+  // leaves these showing as "<br>" in the middle of cells.
+  const INLINE = /(`[^`]+`)|(\[([^\]]+)\]\(([^)]+)\))|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(\bhttps?:\/\/[^\s<>)\]]+)|(\n)|(<br\s*\/?>)/gi;
 
   function inlineInto(parent, text) {
     const src = String(text ?? "");
@@ -96,7 +127,7 @@ globalThis.HERMES_MD = (() => {
       else if (m[5]) add("strong", m[6]);
       else if (m[7]) add("em", m[8]);
       else if (m[9]) link(parent, m[9], m[9]);
-      else if (m[10]) parent.appendChild(document.createElement("br"));
+      else if (m[10] || m[11]) parent.appendChild(document.createElement("br"));
 
       last = m.index + m[0].length;
     }
@@ -119,9 +150,103 @@ globalThis.HERMES_MD = (() => {
     parent.appendChild(a);
   }
 
+  // ── table renderer ────────────────────────────────────────────────────────
+  // A table only stays a grid while it can plausibly fit the pane. Past that —
+  // too many columns, or cells holding whole paragraphs (recipes, checklists,
+  // comparison matrices) — it flips to the same stacked "Header: value" layout
+  // the Hermes TUI falls back to, which stays readable at any width.
+  const GRID_MAX_COLS = 4;
+  const GRID_MAX_CELL = 60;      // characters in a single cell
+  const GRID_MAX_ROW = 120;      // characters across a whole row
+
+  const stripMarks = (s) => String(s)
+    .replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1").replace(/`([^`]+)`/g, "$1");
+
+  function renderTable(rows) {
+    const headers = rows[0] || [];
+    const cols = headers.length;
+    const body = rows.slice(1).map((row) => {
+      const cells = row.slice(0, cols);
+      while (cells.length < cols) cells.push("");   // ragged rows padded out
+      return cells;
+    });
+
+    // Header-only table: nothing to lay out, so just list the columns.
+    if (!body.length) {
+      const p = document.createElement("p");
+      p.className = "md-heads";
+      p.textContent = headers.map(stripMarks).join(" · ");
+      return p;
+    }
+
+    const longestCell = Math.max(...rows.map((r) => Math.max(...r.map((c) => c.length), 0)), 0);
+    const widestRow = Math.max(...rows.map((r) => r.join("  ").length), 0);
+    const grid = cols <= GRID_MAX_COLS && longestCell <= GRID_MAX_CELL && widestRow <= GRID_MAX_ROW;
+
+    if (grid) {
+      const wrap = document.createElement("div");
+      wrap.className = "md-table-wrap";
+      const table = document.createElement("table");
+      table.className = "md-table";
+
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      for (const h of headers) {
+        const th = document.createElement("th");
+        inlineInto(th, h);
+        headRow.appendChild(th);
+      }
+      head.appendChild(headRow);
+      table.appendChild(head);
+
+      const tbody = document.createElement("tbody");
+      for (const row of body) {
+        const tr = document.createElement("tr");
+        for (const cell of row) {
+          const td = document.createElement("td");
+          inlineInto(td, cell);
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      wrap.appendChild(table);
+      return wrap;
+    }
+
+    // Stacked: one block per row, each cell labelled with its column.
+    const wrap = document.createElement("div");
+    wrap.className = "md-rows";
+    for (const row of body) {
+      const card = document.createElement("div");
+      card.className = "md-row";
+      row.forEach((cell, ci) => {
+        if (!cell) return;                       // an empty cell is just noise here
+        const field = document.createElement("div");
+        field.className = "md-field";
+        const key = document.createElement("span");
+        key.className = "md-key";
+        key.textContent = `${stripMarks(headers[ci]) || `Col ${ci + 1}`}:`;
+        field.appendChild(key);
+        field.appendChild(document.createTextNode(" "));
+        inlineInto(field, cell);
+        card.appendChild(field);
+      });
+      if (card.childNodes.length) wrap.appendChild(card);
+    }
+    return wrap;
+  }
+
   // ── block renderer ────────────────────────────────────────────────────────
   function renderBlock(block) {
     switch (block.type) {
+      case "table":
+        return renderTable(block.rows);
+      case "quote": {
+        const q = document.createElement("blockquote");
+        inlineInto(q, block.content);
+        return q;
+      }
       case "code": {
         const pre = document.createElement("pre");
         pre.className = "md-pre";
@@ -171,7 +296,9 @@ globalThis.HERMES_MD = (() => {
     if (!last) return frag;
     if (last.tagName === "UL" || last.tagName === "OL") return last.lastElementChild || frag;
     if (last.tagName === "PRE") return last.firstElementChild || last;
-    if (last.tagName === "HR") return frag;
+    // Tables own their internal structure — a stray span inside one gets
+    // hoisted out by the parser, so the caret trails the block instead.
+    if (last.tagName === "HR" || last.tagName === "DIV") return frag;
     return last;
   }
 
