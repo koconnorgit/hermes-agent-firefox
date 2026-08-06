@@ -37,13 +37,22 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # Signing is release-only. AMO rejects a version it has already accepted,
+      # so a manual run that signs burns that version and the later release run
+      # dies on "Version X already exists" with nothing attached — this is what
+      # broke v0.1.7. Manual runs stay unsigned so they can never poison a release.
       - name: Build or sign
         id: pack
         env:
           WEB_EXT_API_KEY: ${{ secrets.WEB_EXT_API_KEY }}
           WEB_EXT_API_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
+          IS_RELEASE: ${{ github.event_name == 'release' }}
         run: |
-          if [ -n "$WEB_EXT_API_KEY" ] && [ -n "$WEB_EXT_API_SECRET" ]; then
+          if [ "$IS_RELEASE" != "true" ]; then
+            echo "Manual run — building an unsigned .zip (signing is release-only)…"
+            npm run build
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$WEB_EXT_API_KEY" ] && [ -n "$WEB_EXT_API_SECRET" ]; then
             echo "AMO credentials present — signing (unlisted)…"
             npm run sign
             echo "signed=true" >> "$GITHUB_OUTPUT"
