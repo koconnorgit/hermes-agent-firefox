@@ -6,6 +6,7 @@
   --foreground: #ffffff;
   --muted: color-mix(in srgb, #ffffff 55%, transparent);
   --hairline: color-mix(in srgb, #ffac02 18%, transparent);
+  --hairline-strong: color-mix(in srgb, #ffac02 38%, transparent);
   --user-bubble: color-mix(in srgb, #ffac02 16%, #170d02);
   --agent-bubble: #241706;
 }
@@ -70,8 +71,53 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .msg--user  { align-self: flex-end; background: var(--user-bubble); border: 1px solid var(--hairline); }
 .msg--agent { align-self: flex-start; background: var(--agent-bubble); }
 .msg--system { align-self: center; color: var(--muted); font-size: 12px; background: transparent; }
-.msg--agent.streaming::after { content: "▌"; color: var(--midground); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
+
+/* ── Rendered markdown (see markdown.js) ──────────────────────────────────
+   Blocks carry their own spacing, so these bubbles drop the pre-wrap that
+   plain-text ones rely on — except inside code, which keeps every space. */
+.md { white-space: normal; overflow-wrap: anywhere; }
+.md > * { margin: 0; }
+.md > * + * { margin-top: 8px; }
+
+.md h1, .md h2, .md h3, .md h4 { line-height: 1.3; }
+.md h1 { font-size: 15px; font-weight: 700; }
+.md h2 { font-size: 14px; font-weight: 700; }
+.md h3 { font-size: 14px; font-weight: 600; }
+.md h4 { font-size: 14px; font-weight: 500; }
+
+.md ul, .md ol { padding-left: 20px; }
+.md li + li { margin-top: 2px; }
+.md li::marker { color: var(--midground); }
+
+.md a { color: var(--midground); text-decoration: underline; text-underline-offset: 2px;
+        text-decoration-color: color-mix(in srgb, var(--midground) 40%, transparent); }
+.md a:hover { text-decoration-color: var(--midground); }
+
+.md hr { border: 0; border-top: 1px solid var(--hairline); }
+.md strong { font-weight: 600; }
+.md em { font-style: italic; }
+
+.md .md-code {
+  padding: 1px 5px; border-radius: 4px; font-size: 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--midground); background: color-mix(in srgb, var(--midground) 12%, transparent);
+}
+.md .md-pre {
+  max-width: 100%; overflow-x: auto; padding: 8px 10px; border-radius: 8px;
+  white-space: pre; background: #120a02; border: 1px solid var(--hairline);
+}
+.md .md-pre code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; line-height: 1.5;
+}
+
+/* Streaming caret — sits at the tail of the last block so it hugs the text
+   instead of dropping onto a line of its own. */
+.md-caret {
+  display: inline-block; width: .5em; height: 1em; margin-left: 2px;
+  vertical-align: -.15em; background: var(--midground);
+  animation: blink 1s steps(2) infinite;
+}
 
 /* Interactive approval / clarify / sudo / secret request card */
 .msg--request {

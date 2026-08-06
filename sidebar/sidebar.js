@@ -41,6 +41,9 @@ const isWindow = new URLSearchParams(location.search).get("ctx") === "window";
 let attachedContext = null; // { title, url, excerpt/selection } sent with next msg
 
 // ── UI helpers ─────────────────────────────────────────────────────────────
+// Plain-text bubble. Used for our own status lines (and for anything a caller
+// then appends elements to), matching the portal, which leaves system messages
+// unformatted.
 function addMsg(role, text = "") {
   const div = document.createElement("div");
   div.className = `msg msg--${role}`;
@@ -48,6 +51,21 @@ function addMsg(role, text = "") {
   el.log.appendChild(div);
   el.log.scrollTop = el.log.scrollHeight;
   return div;
+}
+
+// Chat bubble with the message rendered as markdown — headings, lists, code,
+// emphasis, links — the way the dashboard renders the same text.
+function addRich(role, text, streaming) {
+  const div = document.createElement("div");
+  div.className = `msg msg--${role} md`;
+  paintRich(div, text, streaming);
+  el.log.appendChild(div);
+  el.log.scrollTop = el.log.scrollHeight;
+  return div;
+}
+function paintRich(node, text, streaming) {
+  node.textContent = "";
+  node.appendChild(globalThis.HERMES_MD.render(text, { streaming }));
 }
 function setStatus(kind, label) {
   el.status.className = `status status--${kind}`;
@@ -147,6 +165,7 @@ async function checkAuth() {
 let gatewayPort = null;
 let viewingStoredId = null;    // storedId the log currently shows
 let streamBubble = null;       // current streaming assistant bubble
+let streamText = "";           // its raw markdown source (the DOM is a render of this)
 let lastToolBubble = null;     // most recent "running tool" note
 const sessionMeta = new Map(); // storedId → { busy, unread } for dropdown markers
 
@@ -185,7 +204,11 @@ function onGatewayMessage(m) {
     case "closed":
       setStatus("off", "disconnected");
       el.send.disabled = false;   // never strand the composer on a dead socket
-      if (streamBubble) { streamBubble.classList.remove("streaming"); streamBubble = null; }
+      if (streamBubble) {
+        clearTimeout(paintTimer); paintTimer = null;
+        paintRich(streamBubble, streamText, false);   // settle it: no caret on a dead socket
+        streamBubble.classList.remove("streaming"); streamBubble = null; streamText = "";
+      }
       if (m.code && m.code !== 1000) addMsg("system", `Gateway closed (code ${m.code}${m.reason ? ": " + m.reason : ""}).`);
       break;
     case "error":
@@ -198,10 +221,10 @@ function onGatewayMessage(m) {
 
 // Build a bubble for one buffered item.
 function renderItem(item) {
-  if (item.kind === "user") return addMsg("user", item.text);
+  if (item.kind === "user") return addRich("user", item.text || "", false);
   if (item.kind === "assistant") {
-    const b = addMsg("agent", item.text || "");
-    if (item.streaming) { b.classList.add("streaming"); streamBubble = b; }
+    const b = addRich("agent", item.text || "", !!item.streaming);
+    if (item.streaming) { b.classList.add("streaming"); streamBubble = b; streamText = item.text || ""; }
     return b;
   }
   if (item.kind === "tool") {
@@ -318,8 +341,9 @@ function respondRequest(item, label, extra) {
 
 function renderLog(storedId, items, busy) {
   viewingStoredId = storedId;
-  streamBubble = null; lastToolBubble = null;
-  el.log.innerHTML = "";
+  clearTimeout(paintTimer); paintTimer = null;
+  streamBubble = null; streamText = ""; lastToolBubble = null;
+  el.log.textContent = "";
   for (const item of items || []) renderItem(item);
   el.log.scrollTop = el.log.scrollHeight;
   const meta = sessionMeta.get(storedId); if (meta) { meta.unread = false; decorateOption(storedId); }
@@ -344,6 +368,20 @@ function requestRerender() {
   }, 250);
 }
 
+// Markdown has to be re-parsed from the whole message on every change, so
+// repaint on a short timer instead of per token — a long reply would otherwise
+// re-render thousands of times as it streams.
+let paintTimer = null;
+function schedulePaint() {
+  if (paintTimer) return;
+  paintTimer = setTimeout(() => {
+    paintTimer = null;
+    if (!streamBubble) return;
+    paintRich(streamBubble, streamText, true);
+    el.log.scrollTop = el.log.scrollHeight;
+  }, 80);
+}
+
 function applyRenderOp(m) {
   switch (m.op) {
     case "push":
@@ -351,15 +389,18 @@ function applyRenderOp(m) {
       el.log.scrollTop = el.log.scrollHeight;
       break;
     case "delta":
-      if (streamBubble) { streamBubble.textContent += m.text; el.log.scrollTop = el.log.scrollHeight; }
+      if (streamBubble) { streamText += m.text; schedulePaint(); }
       else requestRerender();
       break;
     case "end":
       if (streamBubble) {
         // m.text is the background's full buffered text — authoritative, since
         // any delta we missed leaves what's on screen truncated.
-        if (typeof m.text === "string" && m.text.length > streamBubble.textContent.length) streamBubble.textContent = m.text;
-        streamBubble.classList.remove("streaming"); streamBubble = null;
+        if (typeof m.text === "string" && m.text.length > streamText.length) streamText = m.text;
+        clearTimeout(paintTimer); paintTimer = null;
+        paintRich(streamBubble, streamText, false);   // final paint, caret dropped
+        streamBubble.classList.remove("streaming"); streamBubble = null; streamText = "";
+        el.log.scrollTop = el.log.scrollHeight;
       } else requestRerender();   // the completed reply would otherwise be dropped
       break;
     case "toolDone":
@@ -603,7 +644,9 @@ browser.storage.onChanged.addListener((changes, area) => {
 });
 
 async function reconnect() {
-  el.log.innerHTML = "";
+  clearTimeout(paintTimer); paintTimer = null;
+  streamBubble = null; streamText = "";
+  el.log.textContent = "";
   setStatus("unknown", "reconnecting…");
   const ok = await checkAuth();
   if (ok) {
