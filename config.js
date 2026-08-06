@@ -5,7 +5,12 @@
 // the DEFAULT host and host-independent endpoint paths; each context reads the
 // live host from storage.local (`settings.host`) at runtime and builds URLs from
 // the helpers below.
-globalThis.HERMES = {
+//
+// The helpers below refer to `H` rather than `this` on purpose: callers are free
+// to pull them off the object (`const { originPattern } = globalThis.HERMES`),
+// and an unbound `this` would silently be `globalThis` in these classic scripts.
+globalThis.HERMES = (() => {
+const H = {
   // Placeholder default — set your actual Hermes host per-install in the
   // extension's Settings (⚙), or change this default for your own build.
   DEFAULT_HOST: "http://localhost:9119",
@@ -24,18 +29,18 @@ globalThis.HERMES = {
   // still alert. The others gate individual on-screen/desktop signals.
   // `newSession`: alert when a brand-new session appears (e.g. a timer/cron run).
   NOTIFY_DEFAULTS: { badge: true, dropdown: true, pill: true, system: true, background: true, newSession: true },
-  notifyConfig(settings) { return { ...this.NOTIFY_DEFAULTS, ...(settings?.notify || {}) }; },
+  notifyConfig(settings) { return { ...H.NOTIFY_DEFAULTS, ...(settings?.notify || {}) }; },
 
   normHost(host) { return String(host || "").replace(/\/+$/, ""); },
   // ws://host/api/ws (or wss:// for an https host) — the JSON-RPC socket.
-  wsUrl(host) { return this.normHost(host).replace(/^http/i, "ws") + "/api/ws"; },
+  wsUrl(host) { return H.normHost(host).replace(/^http/i, "ws") + "/api/ws"; },
   // Match pattern for host_permissions / permissions.request.
   // Firefox match patterns must NOT contain a port — "http://host:9119/*" is an
   // invalid pattern that permissions.request()/contains() silently reject, so the
   // grant prompt never shows and access is never obtained (see Firefox bug 1362809).
   // Drop the port; a portless pattern matches the host on every port.
   originPattern(host) {
-    const h = this.normHost(host);
+    const h = H.normHost(host);
     try {
       const u = new URL(h);
       return `${u.protocol}//${u.hostname}/*`;
@@ -44,3 +49,5 @@ globalThis.HERMES = {
     }
   },
 };
+return H;
+})();

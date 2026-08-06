@@ -78,11 +78,22 @@ async function saveHost() {
   setTimeout(() => { hostSaved.textContent = ""; }, 2500);
 }
 
+// A throw inside saveHost() would otherwise reject invisibly and the button would
+// look inert — report it in the status line instead.
+async function saveHostReporting() {
+  try { await saveHost(); }
+  catch (e) {
+    console.error("[hermes] saving host failed:", e);
+    hostSaved.style.color = "#ff8f6b";
+    hostSaved.textContent = "Couldn't save: " + (e?.message || e);
+  }
+}
+
 radios.sidebar.addEventListener("change", saveView);
 radios.window.addEventListener("change", saveView);
 for (const box of Object.values(notifyBoxes)) box.addEventListener("change", saveNotify);
-document.getElementById("host-save").addEventListener("click", saveHost);
-hostInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveHost(); } });
+document.getElementById("host-save").addEventListener("click", saveHostReporting);
+hostInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveHostReporting(); } });
 
 document.getElementById("close").addEventListener("click", async () => {
   try {
