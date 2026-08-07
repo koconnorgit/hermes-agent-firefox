@@ -223,9 +223,13 @@ function onGatewayMessage(m) {
       if (m.code && m.code !== 1000) addMsg("system", `Gateway closed (code ${m.code}${m.reason ? ": " + m.reason : ""}).`);
       break;
     case "error":
-      setStatus("off", "error");
       addMsg("system", `⚠ ${m.error}`);
       el.send.disabled = false;
+      // Only a connection-level failure earns the pill. An action that failed —
+      // typically a respond the gateway nacked after already applying it — says
+      // nothing about the session, which is still working or still blocked on
+      // input; the background re-asserts that state right behind this message.
+      if (m.action !== "respond") setStatus("off", "error");
       break;
   }
 }

@@ -780,11 +780,14 @@ class Gateway {
       case "clarify.request":
         this._push(s, { kind: "request", rtype: "clarify", liveId: ev.session_id, requestId: p.request_id, question: p.question || "", choices: (p.choices && p.choices.length) ? p.choices : null, multi: !!p.multi_select, resolved: false });
         this._needsInput(s); break;
+      // Keep request_id the way clarify does. The gateway files a pending
+      // password/secret prompt under that id, and answering with the session
+      // alone is what comes back as "no pending password request".
       case "sudo.request":
-        this._push(s, { kind: "request", rtype: "sudo", liveId: ev.session_id, question: p.prompt || p.message || "Password required", choices: null, resolved: false });
+        this._push(s, { kind: "request", rtype: "sudo", liveId: ev.session_id, requestId: p.request_id, question: p.prompt || p.message || "Password required", choices: null, resolved: false });
         this._needsInput(s); break;
       case "secret.request":
-        this._push(s, { kind: "request", rtype: "secret", liveId: ev.session_id, question: p.prompt || p.message || p.name || "Secret required", choices: null, resolved: false });
+        this._push(s, { kind: "request", rtype: "secret", liveId: ev.session_id, requestId: p.request_id, question: p.prompt || p.message || p.name || "Secret required", choices: null, resolved: false });
         this._needsInput(s); break;
     }
   }
@@ -794,10 +797,19 @@ class Gateway {
     const storedId = m.liveId ? this.liveToStored.get(m.liveId) : this.active;
     const s = storedId ? this.sessions.get(storedId) : null;
     if (s) this._resolveRequest(s, m);
-    if (m.rtype === "approval") return this.request("approval.respond", { choice: m.choice, session_id: m.liveId });
+    // Address the session by the id it has NOW, not the one stamped on the card.
+    // A sudo prompt tends to sit on screen for as long as it takes someone to
+    // type a password, and any socket blink in that window re-resumes the
+    // session under a fresh live id — answering the old one is an unknown
+    // session to the gateway.
+    const sid = s?.liveId || m.liveId;
+    // Only name a request_id when the prompt actually carried one — an explicit
+    // null is a lookup miss on a gateway that keys these by session instead.
+    const rid = m.requestId ? { request_id: m.requestId } : {};
+    if (m.rtype === "approval") return this.request("approval.respond", { choice: m.choice, session_id: sid, ...rid });
     if (m.rtype === "clarify") return this.request("clarify.respond", { request_id: m.requestId, answer: m.answer ?? "" });
-    if (m.rtype === "sudo") return this.request("sudo.respond", { session_id: m.liveId, password: m.password ?? "" });
-    if (m.rtype === "secret") return this.request("secret.respond", { session_id: m.liveId, value: m.value ?? "" });
+    if (m.rtype === "sudo") return this.request("sudo.respond", { session_id: sid, password: m.password ?? "", ...rid });
+    if (m.rtype === "secret") return this.request("secret.respond", { session_id: sid, value: m.value ?? "", ...rid });
   }
   _resolveRequest(s, m) {
     for (let i = s.log.length - 1; i >= 0; i--) {
@@ -1140,7 +1152,16 @@ browser.runtime.onConnect.addListener((port) => {
         if (s) { s.unread = false; gateway.updateBadge(); }
       }
     } catch (e) {
-      port.postMessage({ type: "error", error: `${e.name || "Error"}: ${e.message}` });
+      // Say which action failed. A failed *action* is not a failed connection:
+      // the gateway nacks some responds it has already applied (a sudo password
+      // reaches the pty either way), so painting the pane's connection pill
+      // "error" over it is both wrong and sticky — nothing recomputes that pill
+      // until the next event happens to arrive.
+      port.postMessage({ type: "error", error: `${e.name || "Error"}: ${e.message}`, action: m?.type || null });
+      // Re-assert the session's real state so the pane settles back onto it
+      // immediately rather than sitting on a stale error until the turn moves.
+      const s = gateway.sessions.get(gateway.active);
+      if (s && gateway.ws?.readyState === WebSocket.OPEN) gateway._activity(s);
     }
   });
 });
