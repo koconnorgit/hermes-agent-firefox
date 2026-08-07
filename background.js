@@ -10,7 +10,7 @@
 // tui_gateway/methods_*.py):
 //   connect  POST /api/auth/ws-ticket → {ticket}; open ws /api/ws?ticket=…
 //   frame    send {jsonrpc:"2.0", id:"w<n>", method, params}; match reply by id
-//   create   session.create {close_on_disconnect:true, source:"tool"} → {session_id}
+//   create   session.create {source:"tool"} → {session_id, stored_session_id}
 //   send     prompt.submit {session_id, text}
 //   stream   {method:"event", params:{type, payload, session_id}} — types:
 //            message.start|delta|complete, reasoning.delta, tool.start|complete,
@@ -45,6 +45,12 @@ function lastAssistantText(items) {
   }
   return "";
 }
+
+// How long after a turn settles we re-read the stored transcript to check our
+// buffer against it. The first pass covers the normal case (the transcript is
+// written just after the turn ends); the rest cover a turn that outlived our
+// socket, where the reply can land minutes after the last event we saw.
+const VERIFY_DELAYS_MS = [1500, 4000, 10000, 30000, 60000, 120000, 120000];
 
 // ── Entry points: context menu, toolbar, sidebar plumbing ───────────────────
 const MENU = { SELECTION: "hermes-ask-selection", PAGE: "hermes-ask-page" };
@@ -239,6 +245,8 @@ class Gateway {
     this._newSessTimer = null;      // debounce for new-session detection
     this.lastFrameAt = 0;           // when the socket last delivered anything
     this._probing = null;           // in-flight liveness probe
+    this._probeFails = 0;           // consecutive unanswered probes
+    this._reconnectTimer = null;    // fast reconnect after a lost socket
   }
 
   // ── background monitoring (alerts while all views are closed) ──
@@ -255,7 +263,7 @@ class Gateway {
     // drives the liveness watchdog, so it runs whenever a view is open or a turn
     // is in flight — not only when background alerts are enabled.
     const needed = notifyCfg.background || this.ports.size > 0 ||
-      [...this.sessions.values()].some((s) => s.busy);
+      [...this.sessions.values()].some((s) => s.busy || s.unfinished);
     if (needed) browser.alarms.create("hermes-keepalive", { periodInMinutes: 0.4 });
     else browser.alarms.clear("hermes-keepalive");
   }
@@ -284,9 +292,16 @@ class Gateway {
 
     if (this.ws?.readyState === WebSocket.OPEN && quiet > (busy.length ? 30000 : 90000) && !this._probing) {
       const ws = this.ws;
-      this._probing = this.request("session.active_list", {}, 10000)
-        .then(() => { this.lastFrameAt = Date.now(); })
+      this._probing = this.request("session.active_list", {}, 20000)
+        .then(() => { this._probeFails = 0; this.lastFrameAt = Date.now(); })
         .catch(() => {
+          // One missed probe is not proof of a dead socket. The gateway runs
+          // most RPCs on its dispatcher thread (only a few slow handlers get a
+          // pool), so a loaded server can leave a perfectly healthy socket
+          // quiet past the deadline — and closing costs us the live session
+          // binding mid-turn. Two strikes before we give up on it.
+          if (++this._probeFails < 2) return;
+          this._probeFails = 0;
           // Unresponsive: drop it so ensureSocket() builds a fresh one. The
           // close may never arrive on a half-open socket, so settle by hand.
           try { ws.close(4000, "heartbeat failed"); } catch {}
@@ -378,15 +393,39 @@ class Gateway {
   // after the reconnect re-arms busy.
   _onSocketLost() {
     this.liveToStored.clear();
+    let hadBusy = false;
     for (const s of this.sessions.values()) {
       s.liveId = null;                        // must re-resume after reconnect
       s.gap = true;
       const closed = this._settle(s);
       // Through _setBusy so the end-of-turn reconciliation runs: whatever the
       // turn produced after the socket died is only in the stored transcript.
-      if (s.busy) this._setBusy(s, false);
+      if (s.busy) { hadBusy = true; this._setBusy(s, false); }
       else if (closed) { this._activity(s); this._scheduleVerify(s); }
     }
+    this._scheduleReconnect(hadBusy);
+  }
+
+  // Get back on the wire without waiting for the next alarm tick (up to ~24s).
+  // The server parks a disconnected session and reaps an idle one after a 20s
+  // grace, and a turn that IS still running only reaches us again once we
+  // re-resume it — so the sooner we reattach, the less of the reply we miss.
+  _scheduleReconnect(hadBusy) {
+    if (this._reconnectTimer) return;
+    if (!hadBusy && this.ports.size === 0 && !notifyCfg.background) return;  // nobody's listening
+    this._reconnectTimer = setTimeout(async () => {
+      this._reconnectTimer = null;
+      try {
+        await this.ensureSocket();
+        // Re-resume what we were following. session.resume reports `running`,
+        // which re-arms busy for a turn that outlived the old socket, and the
+        // gap flag makes openSession re-read the transcript.
+        for (const storedId of new Set([this.active, ...this.watched].filter(Boolean))) {
+          if (this.sessions.has(storedId)) { try { await this.openSession(storedId); } catch {} }
+        }
+        this.rerender();
+      } catch { /* the keepalive alarm keeps retrying */ }
+    }, 1000);
   }
 
   // Tear down the connection + buffered sessions (e.g. the host changed). The
@@ -416,13 +455,25 @@ class Gateway {
   // ── sessions ──
   _session(storedId) {
     let s = this.sessions.get(storedId);
-    if (!s) { s = { storedId, fetchId: storedId, liveId: null, log: [], busy: false, unread: false, seeded: false, gap: false, announced: true, verifyTimer: null }; this.sessions.set(storedId, s); }
+    if (!s) { s = { storedId, fetchId: storedId, liveId: null, log: [], busy: false, unread: false, seeded: false, gap: false, announced: true, unfinished: false, verifyTimer: null }; this.sessions.set(storedId, s); }
     return s;
   }
 
   async newSession() {
     await this.ensureSocket();
-    const res = await this.request("session.create", { close_on_disconnect: true, source: "tool" });
+    // Deliberately NOT close_on_disconnect. That flag is for a sidecar whose
+    // life ends with its page (the dashboard's chat tab): the gateway reaps
+    // those sessions the instant the socket drops — immediately, with no grace
+    // window and no exemption for a turn in flight (server.py
+    // _close_sessions_for_transport → _close_session_by_id, which terminates
+    // the worker). Our socket blinks as a matter of course: the event page
+    // suspends, wifi flips, the liveness watchdog force-closes a half-open
+    // one. With the flag, every one of those blinks KILLED the running turn —
+    // so the longer a reply took, the likelier it was to simply never arrive.
+    // Without it the session is only detached: _ws_session_is_orphaned refuses
+    // to reap anything still `running`, and an idle session gets a 20s grace
+    // that our reconnect + session.resume cancels.
+    const res = await this.request("session.create", { source: "tool" });
     const liveId = res?.session_id;
     const storedId = res?.stored_session_id || liveId;
     const s = this._session(storedId);
@@ -506,6 +557,7 @@ class Gateway {
     s.log = items.concat(keep);
     s.gap = false;
     s.seeded = true;
+    if (fresh.length > before.length) s.unfinished = false;   // the turn's reply is in hand
     if (this._isActive(s)) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
     // We only learned about this reply by re-reading the transcript, so nothing
     // announced it — raise the badge/notification now rather than leaving the
@@ -563,9 +615,12 @@ class Gateway {
       case "message.interim": this._sealInterim(s, txt(p.text)); break;
       // payload.text is the whole final reply; `rendered` is the same text
       // pre-wrapped for terminals and is all we get on some frames.
+      // _completed before _setBusy: it marks the turn announced, which is what
+      // tells the busy flip this turn ended properly (and not with a silence
+      // worth chasing).
       case "message.complete":
         this._endAssistant(s, txt(p.text) || txt(p.rendered));
-        this._setBusy(s, false); this._completed(s); this._scheduleVerify(s);
+        this._completed(s); this._setBusy(s, false); this._scheduleVerify(s);
         break;
       case "tool.start": this._push(s, { kind: "tool", name: p.name || p.tool || "tool", done: false }); break;
       case "tool.complete": this._toolDone(s, p.name || p.tool); break;
@@ -671,7 +726,12 @@ class Gateway {
   _setBusy(s, busy) {
     if (s.busy === busy) return;
     s.busy = busy;
-    if (busy) s.announced = false;
+    if (busy) { s.announced = false; s.unfinished = false; }
+    // A turn that goes quiet without ever producing a reply we could announce
+    // didn't finish as far as we can tell — the socket died under it, or the
+    // completion frame never reached us. Keep re-checking the transcript
+    // instead of accepting the silence (see _verifyTurn).
+    else s.unfinished = !s.announced;
     this._activity(s);
     this._ensureAlarm();          // watchdog runs for the duration of a turn
     if (!busy) this._scheduleVerify(s);
@@ -683,19 +743,31 @@ class Gateway {
   // way — a reply that's complete on the server and truncated (or missing)
   // here, with no notification. So after every turn settles, check our buffer
   // against the stored transcript, which is the authoritative copy.
-  _scheduleVerify(s) {
+  _scheduleVerify(s, attempt = 0) {
     clearTimeout(s.verifyTimer);
-    // Small delay: the transcript is persisted just after the turn ends, so an
-    // immediate read can still be a message behind.
-    s.verifyTimer = setTimeout(() => this._verifyTurn(s).catch(() => {}), 1500);
+    if (attempt >= VERIFY_DELAYS_MS.length) {
+      // Out of patience. Drop the flag so it stops holding the keepalive alarm
+      // open; ⟳ and the next reconnect still re-read the transcript.
+      s.unfinished = false; this._ensureAlarm(); return;
+    }
+    s.verifyTimer = setTimeout(() => this._verifyTurn(s, attempt).catch(() => {}), VERIFY_DELAYS_MS[attempt]);
   }
-  async _verifyTurn(s) {
+  async _verifyTurn(s, attempt = 0) {
     if (s.busy) return;                       // a new turn is running; its own end verifies
     const items = await this._fetchHistory(s);
-    if (!items) return;
+    if (!items) { if (s.unfinished) this._scheduleVerify(s, attempt + 1); return; }
     // Only ever adopt MORE text — a transcript that lags behind must never
     // shorten what we already showed.
-    if (lastAssistantText(items).length > lastAssistantText(s.log).length) await this._resync(s);
+    if (lastAssistantText(items).length > lastAssistantText(s.log).length) {
+      await this._resync(s);                  // clears `unfinished` and announces
+      this._ensureAlarm();
+      return;
+    }
+    // Nothing new yet. For a turn we watched finish cleanly that's the end of
+    // it; for one that went quiet on us the reply may still be minutes out, so
+    // keep looking on a widening interval rather than giving up at 1.5s (which
+    // is how a long reply used to sit invisible until the user hit ⟳).
+    if (s.unfinished) this._scheduleVerify(s, attempt + 1);
   }
   _activity(s) { this.broadcast({ type: "activity", storedId: s.storedId, busy: s.busy, unread: s.unread }); }
   // Alert when the reply isn't the session you're actively looking at — which

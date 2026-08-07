@@ -19,6 +19,7 @@ const el = {
   chipClear: document.getElementById("context-clear"),
   sessionSelect: document.getElementById("session-select"),
   sessionRefresh: document.getElementById("session-refresh"),
+  openWeb: document.getElementById("open-web"),
   popout: document.getElementById("popout"),
   settings: document.getElementById("settings"),
   waiting: document.getElementById("waiting"),
@@ -559,6 +560,28 @@ function setupPopButton() {
   }
 }
 
+// ── Open the current chat in the dashboard ─────────────────────────────────
+// The web UI resumes a transcript at /chat?resume=<session id> — the same link
+// its own Sessions page uses. With no session open yet, land on a blank /chat.
+function dashboardChatUrl() {
+  return HOST + "/chat" + (viewingStoredId ? `?resume=${encodeURIComponent(viewingStoredId)}` : "");
+}
+
+async function openInDashboard() {
+  const url = dashboardChatUrl();
+  // In the pop-out, "the current window" is a popup with no tab strip, so a bare
+  // tabs.create would bury the tab in it. Aim at a real browser window instead.
+  if (isWindow) {
+    const wins = await browser.windows.getAll({ windowTypes: ["normal"] }).catch(() => []);
+    const target = wins.find((w) => w.id === dockTargetWindowId) || wins.find((w) => w.focused) || wins[0];
+    if (!target) { await browser.windows.create({ url }); return; }
+    await browser.tabs.create({ url, windowId: target.id, active: true });
+    await browser.windows.update(target.id, { focused: true }).catch(() => {});
+    return;
+  }
+  await browser.tabs.create({ url, active: true });
+}
+
 // ── Page-context attach ────────────────────────────────────────────────────
 async function attachActivePage() {
   const resp = await browser.runtime
@@ -627,6 +650,9 @@ el.sessionRefresh.addEventListener("click", () => {
   // Manual escape hatch: re-pull the open session's transcript from the server,
   // so a reply that arrived while we were disconnected shows up on demand.
   if (viewingStoredId) connectGateway().postMessage({ type: "resync", storedId: viewingStoredId });
+});
+el.openWeb.addEventListener("click", () => {
+  openInDashboard().catch((e) => addMsg("system", `Couldn't open the dashboard: ${e.message}`));
 });
 el.settings.addEventListener("click", () => browser.runtime.openOptionsPage());
 setupPopButton();
