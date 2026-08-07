@@ -232,3 +232,14 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .send { background: var(--midground); color: #170d02; font-weight: 600; border-color: transparent; }
 .send:disabled { opacity: .5; cursor: default; }
 .icon-btn { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.icon-btn:disabled { opacity: .35; cursor: default; }
+
+/* Pin toggle: greyed out while the chat is unpinned, lit when it's pinned, so
+   the button doubles as the indicator for the chat currently on screen. */
+.pin-btn { filter: grayscale(1); opacity: .6; }
+.pin-btn[aria-pressed="true"] {
+  filter: none; opacity: 1;
+  border-color: var(--midground);
+  background: color-mix(in srgb, #ffac02 14%, var(--panel));
+}
+.pin-btn:disabled { filter: grayscale(1); opacity: .3; }

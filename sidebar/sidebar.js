@@ -18,6 +18,7 @@ const el = {
   chipLabel: document.getElementById("context-label"),
   chipClear: document.getElementById("context-clear"),
   sessionSelect: document.getElementById("session-select"),
+  sessionPin: document.getElementById("session-pin"),
   sessionRefresh: document.getElementById("session-refresh"),
   openWeb: document.getElementById("open-web"),
   popout: document.getElementById("popout"),
@@ -208,6 +209,7 @@ function onGatewayMessage(m) {
     case "log":        renderLog(m.storedId, m.items, m.busy, m.awaiting); break;
     case "render":     if (m.storedId === viewingStoredId) applyRenderOp(m); break;
     case "activity":   onActivity(m); break;
+    case "sessions-state": onSessionsState(m); break;
     case "notify":     break; // OS notification is fired by the background
     case "sessions-changed": scheduleSessionsReload(); break;
     case "closed":
@@ -464,7 +466,12 @@ function renderLog(storedId, items, busy, awaiting) {
   el.log.textContent = "";
   for (const item of items || []) renderItem(item);
   el.log.scrollTop = el.log.scrollHeight;
-  const meta = sessionMeta.get(storedId); if (meta) { meta.unread = false; decorateOption(storedId); }
+  const meta = sessionMeta.get(storedId);
+  if (meta?.unread) {
+    meta.unread = false;
+    decorateOption(storedId);
+    scheduleReorder();          // read now, so it drops out of the unread group
+  }
   updateUnreadIndicators();
   syncDropdownTo(storedId);
   setTurnStatus(busy, awaiting);
@@ -528,12 +535,28 @@ function applyRenderOp(m) {
 }
 
 function onActivity(m) {
+  const was = groupOf(m.storedId);
   sessionMeta.set(m.storedId, { busy: m.busy, unread: m.unread });
   if (m.storedId === viewingStoredId) {
     setTurnStatus(m.busy, m.awaiting);
     el.send.disabled = !!m.busy;
   }
   decorateOption(m.storedId);
+  // A reply landing (or being read) moves the chat between the unread and
+  // recent groups — reorder so it doesn't stay buried down the list.
+  if (groupOf(m.storedId) !== was) scheduleReorder();
+  updateUnreadIndicators();
+}
+
+// The background's snapshot of every session it's tracking, sent when this view
+// connects. Without it the pane opens knowing nothing about replies that landed
+// while it was closed, so unread chats wouldn't sort or mark until the next event.
+function onSessionsState(m) {
+  for (const s of m.sessions || []) {
+    sessionMeta.set(s.storedId, { busy: s.busy, unread: s.unread });
+    decorateOption(s.storedId);
+  }
+  scheduleReorder();
   updateUnreadIndicators();
 }
 
@@ -573,44 +596,142 @@ function scheduleSessionsReload() {          // debounce: sessions.changed fires
   sessionsReloadTimer = setTimeout(loadSessions, 400);
 }
 
+// The server's session list, newest first, as last fetched. Kept so the picker
+// can be re-grouped (pin toggled, a reply arrived) without another round trip.
+let sessionList = [];
+// Pinned chats, shared between the sidebar and the pop-out window via
+// storage.local. Capped so a long-lived install can't grow it without bound.
+const PIN_LIMIT = 50;
+let pinnedIds = new Set();
+
 function optionFor(storedId) {
   return [...el.sessionSelect.options].find((o) => o.value === storedId);
 }
-function decorateOption(storedId) {          // prefix a marker for unread/busy sessions
+// Prefix markers onto an option: 📌 for pinned (the group headings aren't
+// visible when the select is closed, so the selected row still has to say so),
+// then ● unread / … busy.
+function decorateOption(storedId) {
   const opt = optionFor(storedId);
   if (!opt || !opt.dataset.base) return;
   const meta = sessionMeta.get(storedId);
-  const mark = meta?.unread ? "● " : meta?.busy ? "… " : "";
+  const mark = (pinnedIds.has(storedId) ? "📌 " : "") + (meta?.unread ? "● " : meta?.busy ? "… " : "");
   opt.textContent = mark + opt.dataset.base;
 }
 function syncDropdownTo(storedId) {
   el.sessionSelect.value = optionFor(storedId) ? storedId : "";
+  updatePinButton();
 }
 
-async function loadSessions() {
-  try {
-    const data = await apiGet(ENDPOINTS.sessions);
-    const sessions = (data?.sessions || [])
-      .filter((s) => (s.message_count || 0) > 0)   // hide empty throwaway sockets, keep real chats
-      .sort((a, b) => (b.last_activity_at || b.started_at || 0) - (a.last_activity_at || a.started_at || 0));
-    const current = el.sessionSelect.value;
-    el.sessionSelect.innerHTML = '<option value="">＋ New chat</option>';
-    for (const s of sessions) {
+// Which group a chat belongs in. Pinned wins over unread: a pinned chat keeps
+// its predictable spot and just wears the ● marker.
+function groupOf(id) {
+  if (pinnedIds.has(id)) return "pinned";
+  return sessionMeta.get(id)?.unread ? "unread" : "recent";
+}
+
+const GROUP_LABELS = { pinned: "Pinned", unread: "Unread", recent: "Recent" };
+
+// Rebuild the picker from `sessionList`: pinned chats first, then ones with an
+// unread reply, then the rest — each group in most-recent-first order, which is
+// how the list already arrives.
+function renderSessionOptions() {
+  const current = el.sessionSelect.value;
+  el.sessionSelect.textContent = "";
+  const first = document.createElement("option");
+  first.value = "";
+  first.textContent = "＋ New chat";
+  el.sessionSelect.appendChild(first);
+
+  const groups = { pinned: [], unread: [], recent: [] };
+  for (const s of sessionList) groups[groupOf(s.id)].push(s);
+
+  // With nothing pinned and nothing unread there's only one group; the headings
+  // would be noise, so drop them and keep the flat list the user knows.
+  const used = Object.keys(groups).filter((k) => groups[k].length);
+  const flat = used.length < 2;
+
+  for (const key of ["pinned", "unread", "recent"]) {
+    if (!groups[key].length) continue;
+    let parent = el.sessionSelect;
+    if (!flat) {
+      parent = document.createElement("optgroup");
+      parent.label = GROUP_LABELS[key];
+      el.sessionSelect.appendChild(parent);
+    }
+    for (const s of groups[key]) {
       const opt = document.createElement("option");
       opt.value = s.id;
       const label = (s.title || s.id).slice(0, 42);
       opt.dataset.base = s.message_count ? `${label} (${s.message_count})` : label;
       opt.textContent = opt.dataset.base;
-      el.sessionSelect.appendChild(opt);
+      parent.appendChild(opt);
       decorateOption(s.id);
     }
-    // Prefer the session actually being viewed (survives the reopen race where
-    // the log restores before the options exist); otherwise keep prior selection.
-    const target = viewingStoredId && optionFor(viewingStoredId) ? viewingStoredId : current;
-    el.sessionSelect.value = target || "";
+  }
+
+  // Prefer the session actually being viewed (survives the reopen race where
+  // the log restores before the options exist); otherwise keep prior selection.
+  const target = viewingStoredId && optionFor(viewingStoredId) ? viewingStoredId : current;
+  el.sessionSelect.value = target || "";
+  updatePinButton();
+}
+
+// Re-grouping swaps options around, which slams a native select's popup shut
+// mid-scroll (and would move a row out from under the pointer). While the user
+// is actually working the picker, hold the reorder and flush it after.
+let pickerBusy = false;
+let reorderPending = false;
+function scheduleReorder() {
+  if (pickerBusy) { reorderPending = true; return; }
+  reorderPending = false;
+  renderSessionOptions();
+}
+function releasePicker() {
+  pickerBusy = false;
+  if (reorderPending) scheduleReorder();
+}
+
+async function loadSessions() {
+  try {
+    const data = await apiGet(ENDPOINTS.sessions);
+    sessionList = (data?.sessions || [])
+      .filter((s) => (s.message_count || 0) > 0)   // hide empty throwaway sockets, keep real chats
+      .sort((a, b) => (b.last_activity_at || b.started_at || 0) - (a.last_activity_at || a.started_at || 0));
+    renderSessionOptions();
   } catch (e) {
     console.warn("[hermes] loadSessions failed:", e);
   }
+}
+
+// ── Pinning ─────────────────────────────────────────────────────────────────
+async function loadPins() {
+  const { pinnedSessions } = await browser.storage.local.get("pinnedSessions").catch(() => ({}));
+  pinnedIds = new Set(Array.isArray(pinnedSessions) ? pinnedSessions : []);
+}
+
+// The button acts on whatever chat is selected — the picker itself is a native
+// <select>, which can't carry a control of its own per row.
+function updatePinButton() {
+  const id = el.sessionSelect.value;
+  const on = !!id && pinnedIds.has(id);
+  el.sessionPin.disabled = !id;
+  el.sessionPin.setAttribute("aria-pressed", String(on));
+  el.sessionPin.title = !id ? "Pin a chat to keep it at the top"
+    : on ? "Unpin this chat" : "Pin this chat to the top";
+}
+
+async function togglePin() {
+  const id = el.sessionSelect.value;
+  if (!id) return;
+  if (pinnedIds.has(id)) pinnedIds.delete(id);
+  else {
+    pinnedIds.add(id);
+    while (pinnedIds.size > PIN_LIMIT) pinnedIds.delete(pinnedIds.values().next().value);  // oldest pin drops
+  }
+  // Written to storage.local so the other view of this extension (sidebar vs
+  // pop-out) picks the change up through storage.onChanged.
+  await browser.storage.local.set({ pinnedSessions: [...pinnedIds] }).catch(() => {});
+  renderSessionOptions();
 }
 
 function selectSession(storedId) {
@@ -760,8 +881,17 @@ el.attach.addEventListener("click", attachActivePage);
 el.chipClear.addEventListener("click", () => setContext(null));
 el.sessionSelect.addEventListener("change", () => {
   const v = el.sessionSelect.value;
+  updatePinButton();
   if (v) selectSession(v); else newChat();
 });
+// The picker is "in use" from the click/keypress that opens it until the
+// selection settles; reorders queued in between (see scheduleReorder) land here.
+el.sessionSelect.addEventListener("mousedown", () => { pickerBusy = true; });
+el.sessionSelect.addEventListener("keydown", (e) => { if (e.key !== "Tab") pickerBusy = true; });
+el.sessionSelect.addEventListener("keyup", (e) => { if (e.key === "Escape") releasePicker(); });
+el.sessionSelect.addEventListener("change", releasePicker);
+el.sessionSelect.addEventListener("blur", releasePicker);
+el.sessionPin.addEventListener("click", togglePin);
 el.sessionRefresh.addEventListener("click", () => {
   loadSessions();
   // Manual escape hatch: re-pull the open session's transcript from the server,
@@ -779,7 +909,14 @@ browser.windows.getCurrent().then((w) => { myWindowId = w.id; }).catch(() => {})
 // user doesn't have to close and reopen the sidebar. (The background resets its
 // socket on the same event — see background.js.)
 browser.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes.settings) return;
+  if (area !== "local") return;
+  // Pins are shared with the other view (sidebar ↔ pop-out): adopt theirs.
+  if (changes.pinnedSessions) {
+    const next = new Set(changes.pinnedSessions.newValue || []);
+    const same = next.size === pinnedIds.size && [...next].every((id) => pinnedIds.has(id));
+    if (!same) { pinnedIds = next; scheduleReorder(); }
+  }
+  if (!changes.settings) return;
   notifyCfg = globalThis.HERMES.notifyConfig(changes.settings.newValue);
   updateUnreadIndicators();   // reflect toggled indicators immediately
   // Tool rows are drawn from the background's buffer, so a mode change only
@@ -812,6 +949,7 @@ async function reconnect() {
   if (settings?.host) HOST = settings.host;   // point at the configured Hermes host
   notifyCfg = globalThis.HERMES.notifyConfig(settings);
   toolMode = globalThis.HERMES.toolDisplay(settings);
+  await loadPins();                           // needed before the picker is built
 
   const { pendingTask } = await browser.storage.session.get("pendingTask");
   const handoff = await consumeHandoff();

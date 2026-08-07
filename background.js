@@ -434,6 +434,18 @@ class Gateway {
   addPort(port) {
     this.ports.add(port);
     this._ensureAlarm();
+    // A view only hears `activity` as it happens, so one opening now would know
+    // nothing about replies that landed while it was closed — and those are
+    // exactly the chats its picker has to mark and float to the top. Hand it
+    // the current state of every session we're tracking.
+    try {
+      port.postMessage({
+        type: "sessions-state",
+        sessions: [...this.sessions.values()].map((s) => ({
+          storedId: s.storedId, busy: s.busy, unread: s.unread, awaiting: s.awaiting,
+        })),
+      });
+    } catch {}
     port.onDisconnect.addListener(() => { this.ports.delete(port); this._ensureAlarm(); });
   }
   broadcast(msg) { for (const p of this.ports) { try { p.postMessage(msg); } catch {} } }

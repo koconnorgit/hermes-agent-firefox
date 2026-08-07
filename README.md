@@ -13,6 +13,9 @@ approvals, all riding your existing dashboard login.
   session is buffered in the background, so a reply that lands while you're
   looking elsewhere is complete when you switch back, with an unread badge +
   desktop notification.
+- **Pinned & unread chats stay on top** — 📌 pins the chat you're in so it always
+  heads the dropdown, and any chat with a reply waiting (●) sorts above the rest
+  instead of sinking down the list. Pins are shared with the pop-out window.
 - **Page context** — a `＋page` button and right-click "Ask Hermes about this
   page / selection" fold the current tab's content into your prompt (works in the
   sidebar and the pop-out window).
