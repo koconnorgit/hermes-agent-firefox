@@ -31,6 +31,21 @@ const H = {
   NOTIFY_DEFAULTS: { badge: true, dropdown: true, pill: true, system: true, background: true, newSession: true },
   notifyConfig(settings) { return { ...H.NOTIFY_DEFAULTS, ...(settings?.notify || {}) }; },
 
+  // How the agent's tool / skill / terminal calls appear in the chat log
+  // (settings.toolDisplay):
+  //   hidden   — leave them out entirely; only prose shows
+  //   compact  — one muted line per call, "✓ terminal"
+  //   detailed — what the native chat shows: Terminal("ls -la") (0.4s) ✓, with
+  //              the call's arguments and result available underneath
+  // The background always buffers the full detail either way, so switching
+  // modes re-renders the open transcript without re-fetching anything.
+  TOOL_DISPLAY_MODES: ["hidden", "compact", "detailed"],
+  TOOL_DISPLAY_DEFAULT: "detailed",
+  toolDisplay(settings) {
+    const v = settings?.toolDisplay;
+    return H.TOOL_DISPLAY_MODES.includes(v) ? v : H.TOOL_DISPLAY_DEFAULT;
+  },
+
   normHost(host) { return String(host || "").replace(/\/+$/, ""); },
   // ws://host/api/ws (or wss:// for an https host) — the JSON-RPC socket.
   wsUrl(host) { return H.normHost(host).replace(/^http/i, "ws") + "/api/ws"; },

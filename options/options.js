@@ -1,11 +1,17 @@
 // Settings persisted in storage.local as { settings: { defaultView, host } }.
 // The background page caches these and reacts via storage.onChanged.
-const { DEFAULT_HOST, normHost, originPattern, notifyConfig } = globalThis.HERMES;
+const { DEFAULT_HOST, normHost, originPattern, notifyConfig, toolDisplay } = globalThis.HERMES;
 
 const radios = {
   sidebar: document.getElementById("view-sidebar"),
   window: document.getElementById("view-window"),
 };
+const toolRadios = {
+  detailed: document.getElementById("tools-detailed"),
+  compact: document.getElementById("tools-compact"),
+  hidden: document.getElementById("tools-hidden"),
+};
+const toolsSaved = document.getElementById("tools-saved");
 const saved = document.getElementById("saved");
 const hostInput = document.getElementById("host");
 const hostSaved = document.getElementById("host-saved");
@@ -34,7 +40,15 @@ async function load() {
   hostInput.value = s.host || DEFAULT_HOST;
   const n = notifyConfig(s);
   for (const [key, box] of Object.entries(notifyBoxes)) box.checked = !!n[key];
+  toolRadios[toolDisplay(s)].checked = true;
   document.getElementById("version").textContent = "v" + browser.runtime.getManifest().version;
+}
+
+async function saveTools() {
+  const mode = Object.keys(toolRadios).find((k) => toolRadios[k].checked) || "detailed";
+  await patchSettings({ toolDisplay: mode });
+  toolsSaved.textContent = "Saved.";
+  setTimeout(() => { toolsSaved.textContent = ""; }, 1500);
 }
 
 async function saveNotify() {
@@ -92,6 +106,7 @@ async function saveHostReporting() {
 radios.sidebar.addEventListener("change", saveView);
 radios.window.addEventListener("change", saveView);
 for (const box of Object.values(notifyBoxes)) box.addEventListener("change", saveNotify);
+for (const r of Object.values(toolRadios)) r.addEventListener("change", saveTools);
 document.getElementById("host-save").addEventListener("click", saveHostReporting);
 hostInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveHostReporting(); } });
 

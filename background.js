@@ -13,8 +13,9 @@
 //   create   session.create {source:"tool"} → {session_id, stored_session_id}
 //   send     prompt.submit {session_id, text}
 //   stream   {method:"event", params:{type, payload, session_id}} — types:
-//            message.start|delta|complete, reasoning.delta, tool.start|complete,
-//            status.update, error, approval.request, …
+//            message.start|delta|complete, reasoning.delta,
+//            tool.start|progress|complete, status.update, error,
+//            approval.request, …
 
 // config.js is loaded before this file (see manifest background.scripts).
 const { ENDPOINTS, DEFAULT_HOST } = globalThis.HERMES;
@@ -37,6 +38,62 @@ function txt(v) {
   }
   return String(v);
 }
+// ── Tool-call detail ────────────────────────────────────────────────────────
+// The gateway's tool events carry far more than a name (tui_gateway/server.py
+// _on_tool_start / _on_tool_complete): an argument preview, the args, the
+// result, a summary, a duration, and an inline diff for edits. That's what the
+// native chat renders and what "detailed" tool display shows here. We buffer it
+// for every session regardless of the user's setting — the sidebar decides how
+// much of it to draw, so flipping the setting is a re-render, not a re-fetch.
+
+// The verbose text fields are printed through Ink for the terminal UI, so they
+// arrive carrying color codes. We render to HTML; strip them.
+const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
+function plain(v) { return String(v ?? "").replace(ANSI_RE, ""); }
+
+// A tool result can be an entire file. Keep a readable head in the buffer (the
+// full text lives in the session transcript on the server, and in the
+// dashboard) so a long session's buffer can't grow without bound.
+const TOOL_TEXT_MAX_CHARS = 2000;
+const TOOL_TEXT_MAX_LINES = 24;
+function toolText(v) {
+  if (v == null || v === "") return "";
+  const s = plain(typeof v === "string" ? v : safeJson(v)).trim();
+  if (!s || s === "{}" || s === "[]") return "";   // an argless call gets no block
+  const lines = s.split("\n");
+  let out = lines.length > TOOL_TEXT_MAX_LINES ? lines.slice(0, TOOL_TEXT_MAX_LINES).join("\n") : s;
+  if (out.length > TOOL_TEXT_MAX_CHARS) out = out.slice(0, TOOL_TEXT_MAX_CHARS);
+  const omitted = s.length - out.length;
+  return omitted > 0 ? `${out}\n… ${omitted} more characters — open the chat in the dashboard for all of it` : out;
+}
+function safeJson(v) {
+  try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+}
+// A stored arguments/result blob is usually a JSON string; parse it so it
+// pretty-prints instead of showing up as one escaped line.
+function maybeJson(v) {
+  if (typeof v !== "string") return v;
+  const t = v.trim();
+  if (!t || !/^[[{]/.test(t)) return v;
+  try { return JSON.parse(t); } catch { return v; }
+}
+// Stand-in for the gateway's build_tool_preview() — the parenthetical in
+// `Terminal("ls -la")`. Live events carry `context` already; rows rebuilt from
+// the stored transcript don't, so derive one from the arguments. Field order
+// follows the desktop client's own preview picker.
+const PREVIEW_KEYS = ["command", "query", "search_term", "path", "file_path", "question", "url", "pattern", "skill", "name", "code", "text"];
+function argPreview(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return "";
+  const pick = (v) => (typeof v === "string" && v.trim() ? compact(v, 80) : "");
+  for (const k of PREVIEW_KEYS) { const p = pick(args[k]); if (p) return p; }
+  for (const v of Object.values(args)) { const p = pick(v); if (p) return p; }
+  return "";
+}
+function compact(s, max) {
+  const one = String(s).replace(/\s+/g, " ").trim();
+  return one.length > max ? one.slice(0, max - 1) + "…" : one;
+}
+
 // The trailing assistant text in a log, for comparing our buffer against the
 // server's stored transcript.
 function lastAssistantText(items) {
@@ -51,6 +108,12 @@ function lastAssistantText(items) {
 // written just after the turn ends); the rest cover a turn that outlived our
 // socket, where the reply can land minutes after the last event we saw.
 const VERIFY_DELAYS_MS = [1500, 4000, 10000, 30000, 60000, 120000, 120000];
+
+// How long a session may be busy with nothing arriving on its own stream before
+// we stop believing the stream and go ask the gateway what it's doing. The
+// socket-level watchdog can't catch this: any other session's traffic keeps the
+// socket looking healthy while one session quietly stops reporting.
+const SESSION_STALL_MS = 45000;
 
 // ── Entry points: context menu, toolbar, sidebar plumbing ───────────────────
 const MENU = { SELECTION: "hermes-ask-selection", PAGE: "hermes-ask-page" };
@@ -228,8 +291,9 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // activity (toolbar badge + dropdown marker + a notification). The sidebar is a
 // thin renderer of the ACTIVE session.
 //
-// Session item shape: {kind:"user"|"assistant"|"tool"|"system", text?, name?,
-// streaming?, done?}.
+// Session item shape: {kind:"user"|"assistant"|"tool"|"system", text?,
+// streaming?} — plus, for "tool": {toolId, name, context, argsText, resultText,
+// summary, error, durationS, diff, done}.
 class Gateway {
   constructor() {
     this.ws = null;
@@ -320,6 +384,38 @@ class Gateway {
         await this._resync(s).catch(() => {});
         if (lastAssistantText(s.log).length > before.length) { this._settle(s); this._setBusy(s, false); }
       }
+      return;                                   // the whole socket was quiet; nothing left to single out
+    }
+
+    // The socket is fine, but a single session has gone silent mid-turn. That's
+    // a hung pane — "working…", locked composer, and a reply that only shows up
+    // when the user hits ⟳ — and the check above can't see it, because the
+    // other sessions keep lastFrameAt fresh.
+    const stalled = busy.filter((s) => s.liveId && Date.now() - (s.lastEventAt || 0) > SESSION_STALL_MS);
+    if (stalled.length) await this._reconcileStalled(stalled).catch(() => {});
+  }
+
+  // Ask the gateway what these sessions are really doing and believe THAT over
+  // our event stream. session.active_list reports a live status per session
+  // (tui_gateway _session_live_status): working / starting / waiting (blocked
+  // on a clarify, sudo or secret answer) / idle. Whatever it says, re-read the
+  // transcript first — the server's copy is the one that's complete.
+  async _reconcileStalled(sessions) {
+    const res = await this.request("session.active_list", {}, 20000);
+    this.lastFrameAt = Date.now();
+    const status = new Map();
+    for (const row of (res?.sessions || [])) if (row?.id) status.set(row.id, String(row.status || ""));
+
+    for (const s of sessions) {
+      const st = status.get(s.liveId);
+      await this._resync(s).catch(() => {});
+      s.lastEventAt = Date.now();               // re-check at most once per stall window
+      const awaiting = st === "waiting";
+      if (awaiting !== s.awaiting) { s.awaiting = awaiting; this._activity(s); }
+      // Idle, or gone from the live list entirely: the turn is over and
+      // whatever ended it never reached us. Settle it here rather than making
+      // the user notice and refresh.
+      if (st === "idle" || st === undefined) { if (this._settle(s)) this._completed(s); this._setBusy(s, false); }
     }
   }
 
@@ -455,7 +551,7 @@ class Gateway {
   // ── sessions ──
   _session(storedId) {
     let s = this.sessions.get(storedId);
-    if (!s) { s = { storedId, fetchId: storedId, liveId: null, log: [], busy: false, unread: false, seeded: false, gap: false, announced: true, unfinished: false, verifyTimer: null }; this.sessions.set(storedId, s); }
+    if (!s) { s = { storedId, fetchId: storedId, liveId: null, log: [], busy: false, unread: false, seeded: false, gap: false, announced: true, unfinished: false, verifyTimer: null, lastEventAt: 0, awaiting: false }; this.sessions.set(storedId, s); }
     return s;
   }
 
@@ -514,12 +610,34 @@ class Gateway {
       const data = await r.json().catch(() => null);
       if (!data) return null;
       const items = [];
+      const pending = new Map();   // tool_call_id → the row still awaiting its result
       for (const m of (data.messages || [])) {
         const content = txt(m.content);
+        if (m.role === "tool") {
+          // A stored tool result, filed under the call it answers. Dropping
+          // these is what left rebuilt history with bare names and no detail.
+          const it = pending.get(m.tool_call_id) ||
+            [...pending.values()].find((x) => !x.resultText && x.name === (m.tool_name || m.name));
+          if (it) { it.resultText = toolText(maybeJson(content)); pending.delete(it.toolId); }
+          continue;
+        }
         if (m.role === "user" && content) items.push({ kind: "user", text: content });
         else if (m.role === "assistant") {
           if (content) items.push({ kind: "assistant", text: content });
-          for (const tc of (m.tool_calls || [])) items.push({ kind: "tool", name: tc.function?.name || tc.name || "tool", done: true });
+          for (const tc of (m.tool_calls || [])) {
+            const fn = tc.function || {};
+            const args = maybeJson(fn.arguments ?? tc.arguments ?? tc.args);
+            const it = {
+              kind: "tool",
+              toolId: tc.id || tc.tool_call_id || "",
+              name: fn.name || tc.name || "tool",
+              context: argPreview(args),
+              argsText: toolText(args),
+              done: true,
+            };
+            items.push(it);
+            if (it.toolId) pending.set(it.toolId, it);
+          }
         }
       }
       return items;
@@ -554,11 +672,16 @@ class Gateway {
     const keep = s.log.filter((it) =>
       (it.kind === "request" && !it.resolved) ||
       (it.kind === "assistant" && it.streaming && it.text && !fresh.includes(it.text)));
+    const prevLen = s.log.length;
     s.log = items.concat(keep);
     s.gap = false;
     s.seeded = true;
     if (fresh.length > before.length) s.unfinished = false;   // the turn's reply is in hand
-    if (this._isActive(s)) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
+    // A re-render rebuilds the whole log: it resets the scroll position and
+    // folds every tool row back up. The stall watchdog resyncs on a timer while
+    // a long turn runs, so only repaint when the transcript actually moved.
+    const changed = fresh !== before || s.log.length !== prevLen;
+    if (changed && this._isActive(s)) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: s.awaiting });
     // We only learned about this reply by re-reading the transcript, so nothing
     // announced it — raise the badge/notification now rather than leaving the
     // turn silently finished.
@@ -594,6 +717,7 @@ class Gateway {
     const storedId = this._route(ev);
     if (!storedId) return;
     const s = this._session(storedId);
+    s.lastEventAt = Date.now();   // this session's own stream is alive
     const p = ev.payload || {};
     switch (ev.type) {
       // The agent loop's own heartbeat. `running` is authoritative — and it's
@@ -612,7 +736,7 @@ class Gateway {
       // Interim assistant commentary (text emitted alongside tool calls). Seal
       // it as its own bubble so the final completion adds a new one instead of
       // overwriting prose the user already read.
-      case "message.interim": this._sealInterim(s, txt(p.text)); break;
+      case "message.interim": this._sealInterim(s, txt(p.text), p.already_streamed); break;
       // payload.text is the whole final reply; `rendered` is the same text
       // pre-wrapped for terminals and is all we get on some frames.
       // _completed before _setBusy: it marks the turn announced, which is what
@@ -622,8 +746,21 @@ class Gateway {
         this._endAssistant(s, txt(p.text) || txt(p.rendered));
         this._completed(s); this._setBusy(s, false); this._scheduleVerify(s);
         break;
-      case "tool.start": this._push(s, { kind: "tool", name: p.name || p.tool || "tool", done: false }); break;
-      case "tool.complete": this._toolDone(s, p.name || p.tool); break;
+      // tool.start's args are the server's redacted display copy
+      // (_redact_tool_args_for_display); tool.complete carries the raw call, so
+      // take Args from the start event and never let the completion overwrite it.
+      case "tool.start":
+        this._push(s, {
+          kind: "tool",
+          toolId: p.tool_id || "",
+          name: p.name || p.tool || "tool",
+          context: compact(plain(p.context || p.preview || ""), 80),
+          argsText: toolText(p.args_text || p.args),
+          done: false,
+        });
+        break;
+      case "tool.progress": this._toolProgress(s, p.name || p.tool, plain(p.preview || "")); break;
+      case "tool.complete": this._toolDone(s, p); break;
       case "error": this._push(s, { kind: "system", text: `⚠ ${txt(p.message) || txt(p.text) || "agent error"}` }); this._setBusy(s, false); break;
       case "approval.request":
         this._push(s, { kind: "request", rtype: "approval", liveId: ev.session_id, command: p.command || "", choices: (p.choices && p.choices.length) ? p.choices : ["once", "deny"], resolved: false });
@@ -690,19 +827,40 @@ class Gateway {
       this._push(s, { kind: "assistant", text: finalText });
     } else s.gap = true;
   }
-  // An interim message means "this prose is final, more may follow". Close the
-  // open bubble on it so later deltas start a fresh one.
-  _sealInterim(s, text) {
+  // An interim message means "this prose is final, more may follow" — the agent
+  // emitted commentary alongside a tool call, or an answer that a verify-on-stop
+  // nudge then sent it back to improve. Close the open bubble on it so later
+  // deltas start a fresh one.
+  //
+  // `already_streamed: false` means the text is content the UI has NOT seen —
+  // the answer was composed off-stream, so there are no deltas for it. Dropping
+  // it (which is what happens if you only ever seal an existing bubble) leaves
+  // the reply invisible while the turn runs on, which is why a turn ending in
+  // "would you like me to continue?" showed nothing until you hit ⟳: that
+  // question is exactly the kind of premature stop the verify-on-stop hook
+  // catches. Mirrors finalizeInterimAssistantMessage() in the reference client
+  // (apps/desktop/.../use-message-stream/index.ts), which seals in place when a
+  // streaming bubble exists and appends a standalone message when it doesn't.
+  _sealInterim(s, text, alreadyStreamed) {
     if (!text) return;
     for (let i = s.log.length - 1; i >= 0; i--) {
       const it = s.log[i];
-      if (it.kind === "assistant" && it.streaming) {
+      if (it.kind !== "assistant" || !it.streaming) continue;
+      // Same prose, streamed to us already → seal it, keeping the fuller copy.
+      if (alreadyStreamed !== false || !it.text || text.includes(it.text)) {
         if (text.length > it.text.length) it.text = text;
         it.streaming = false;
         this._emit(s, { op: "end", text: it.text });
         return;
       }
+      // Unrelated prose was streaming (mid-turn narration) and the interim is
+      // separate content: seal that bubble on its own text, then add this below.
+      it.streaming = false;
+      this._emit(s, { op: "end", text: it.text });
+      break;
     }
+    if (lastAssistantText(s.log) === text) return;   // already on screen
+    this._push(s, { kind: "assistant", text });
   }
   // Un-stream a bubble nothing ever closed. True if it actually closed one.
   _settle(s) {
@@ -717,16 +875,61 @@ class Gateway {
     }
     return false;
   }
-  _toolDone(s, name) {
+  // Fold a tool.complete into the row its tool.start opened. Matched by
+  // tool_id when the payload has one (concurrent tool calls interleave, so the
+  // newest unfinished row is not always the right one) and by "last one still
+  // running" otherwise.
+  _toolDone(s, p = {}) {
+    const id = p.tool_id || "";
+    const name = p.name || p.tool || "";
     for (let i = s.log.length - 1; i >= 0; i--) {
       const it = s.log[i];
-      if (it.kind === "tool" && !it.done) { it.done = true; if (name) it.name = name; this._emit(s, { op: "toolDone", name: it.name }); break; }
+      if (it.kind !== "tool") continue;
+      if (id ? it.toolId !== id : it.done) continue;
+      this._fillToolResult(it, p);
+      if (name) it.name = name;
+      this._emit(s, { op: "toolUpdate", item: it });
+      return;
+    }
+    // No open row — we attached mid-turn and missed the start. Show the call
+    // anyway rather than dropping it.
+    const item = { kind: "tool", toolId: id, name: name || "tool", context: argPreview(p.args), argsText: toolText(p.args), done: true };
+    this._fillToolResult(item, p);
+    this._push(s, item);
+  }
+  _fillToolResult(it, p) {
+    it.done = true;
+    // The gateway only sets `error` on some paths; a tool that reports failure
+    // in its own JSON result is still a failure worth marking.
+    const resultErr = p.result && typeof p.result === "object" && typeof p.result.error === "string" ? p.result.error : "";
+    it.error = compact(plain(p.error || resultErr), 200);
+    if (typeof p.duration_s === "number") it.durationS = p.duration_s;
+    if (p.summary) it.summary = compact(plain(p.summary), 200);
+    // result_text is the server-redacted copy (verbose sessions only); the raw
+    // result is always present and is what the desktop client renders.
+    it.resultText = toolText(p.result_text != null ? p.result_text : p.result);
+    if (p.inline_diff) it.diff = toolText(p.inline_diff);
+    if (!it.argsText) it.argsText = toolText(p.args);
+    if (!it.context) it.context = argPreview(p.args);
+  }
+  // Long-running tools stream a fresher preview (a terminal's latest output
+  // line, a search's current target) — the native chat swaps it into the row.
+  _toolProgress(s, name, preview) {
+    if (!preview) return;
+    for (let i = s.log.length - 1; i >= 0; i--) {
+      const it = s.log[i];
+      if (it.kind !== "tool" || it.done) continue;
+      if (name && it.name !== name) continue;
+      it.context = compact(preview, 80);
+      this._emit(s, { op: "toolUpdate", item: it });
+      return;
     }
   }
   _setBusy(s, busy) {
     if (s.busy === busy) return;
     s.busy = busy;
-    if (busy) { s.announced = false; s.unfinished = false; }
+    s.awaiting = false;              // a turn that starts or ends isn't blocked on an answer
+    if (busy) { s.announced = false; s.unfinished = false; s.lastEventAt = Date.now(); }
     // A turn that goes quiet without ever producing a reply we could announce
     // didn't finish as far as we can tell — the socket died under it, or the
     // completion frame never reached us. Keep re-checking the transcript
@@ -769,7 +972,7 @@ class Gateway {
     // is how a long reply used to sit invisible until the user hit ⟳).
     if (s.unfinished) this._scheduleVerify(s, attempt + 1);
   }
-  _activity(s) { this.broadcast({ type: "activity", storedId: s.storedId, busy: s.busy, unread: s.unread }); }
+  _activity(s) { this.broadcast({ type: "activity", storedId: s.storedId, busy: s.busy, unread: s.unread, awaiting: s.awaiting }); }
   // Alert when the reply isn't the session you're actively looking at — which
   // includes the case where NO view is open (ports empty), so a reply to the
   // last-viewed session still notifies.
@@ -847,7 +1050,7 @@ class Gateway {
   // itself out of sync with the stream (see the sidebar's render ops).
   rerender() {
     const s = this.active ? this.sessions.get(this.active) : null;
-    if (s) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
+    if (s) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: s.awaiting });
   }
 
   _setActive(storedId) {
@@ -861,13 +1064,13 @@ class Gateway {
     const s = await this.openSession(storedId);
     this._setActive(storedId);
     s.unread = false; this.updateBadge();
-    this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
+    this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: s.awaiting });
     return s;
   }
   async viewNew() {
     const s = await this.newSession();
     this._setActive(s.storedId);
-    this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy });
+    this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: s.awaiting });
     return s;
   }
   async resumeActive() {

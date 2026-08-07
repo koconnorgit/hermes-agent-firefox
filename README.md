@@ -20,6 +20,10 @@ approvals, all riding your existing dashboard login.
   default in Settings. Reopen the pane with the toolbar icon or `Ctrl+Shift+Y`.
 - **Interactive requests** — answer the agent's approval, clarify (single &
   multi-select), sudo, and secret prompts inline instead of in the dashboard.
+- **Tool activity** — see what the agent actually ran. **Settings → Tool
+  activity** picks between the native chat's full line
+  (`Terminal("ls -la") (0.4s) ✓`, with the call's arguments and result a click
+  away), just the tool's name, or hiding tool calls altogether.
 
 ## Requirements
 
@@ -80,6 +84,12 @@ let a popup reopen a sidebar — reopen it with the toolbar icon or **Ctrl+Shift
 the background; the full text is there when the turn finishes. Reselecting the
 session reloads it complete.
 
+**Stuck on "working…".** A session that stops reporting mid-turn is re-checked
+against the server after about a minute, and settles itself — so a reply that
+never streamed still appears, and the composer unlocks, without a refresh. If
+the pill reads **waiting for input**, Hermes is blocked on an answer (a clarify,
+sudo or secret prompt), not still working. ⟳ re-pulls the transcript on demand.
+
 **No badge / notification for other sessions.** Check **Settings → Notifications**
 (toolbar badge, dropdown highlight, "response waiting" note, desktop notification,
 and new-session alerts are each toggleable), and that Firefox/your OS allows
@@ -88,6 +98,12 @@ timer/cron run), not just replies in existing ones.
 To get alerts when the sidebar/window is **closed**, keep **"Alert while closed"**
 on — it holds a light background connection so replies still notify (turn it off
 to avoid any background network use).
+
+**Tool calls are missing, or too noisy.** **Settings → Tool activity** switches
+between full detail, name-only, and hidden; the change applies to the open chat
+immediately. If rows never appear at all in any mode, your Hermes host has tool
+progress turned off server-side (`display.tool_progress` in its `config.yaml`) —
+the extension can only show what the gateway sends.
 
 **Not updating.** Force a check at `about:addons` → gear → **Check for Updates**.
 The installed build must be a signed release for auto-updates to apply.
@@ -100,7 +116,7 @@ The installed build must be a signed release for auto-updates to apply.
 | `config.js` | Default host + host-independent endpoint paths and URL helpers. |
 | `background.js` | Session hub: one WebSocket, buffers every session, routes events; owns all network I/O, context menu, window/sidebar plumbing, notifications. |
 | `sidebar/` | The chat UI (renders the active session; also runs as the pop-out window). |
-| `options/` | Settings page (host + default view). |
+| `options/` | Settings page (host, default view, tool activity, notifications). |
 | `content.js` | Extracts page title / selection / text on request. |
 | `icons/` | Toolbar / sidebar icon. |
 

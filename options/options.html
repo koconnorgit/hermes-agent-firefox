@@ -39,6 +39,11 @@
       border: 1px solid var(--hairline); border-radius: 10px;
     }
     .host-input:focus { outline: none; border-color: var(--midground); }
+    .desc code {
+      padding: 1px 4px; border-radius: 4px; font-size: 11px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      color: var(--midground); background: color-mix(in srgb, var(--midground) 12%, transparent);
+    }
   </style>
 </head>
 <body>
@@ -68,6 +73,24 @@
       <span><span class="label">Floating window</span><br><span class="desc">Open (or focus) a standalone window instead.</span></span>
     </label>
     <div class="saved" id="saved"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Tool activity</legend>
+    <p class="sub" style="margin:0 0 8px">How Hermes' skill, terminal and tool calls appear in the chat.</p>
+    <label class="opt">
+      <input type="radio" name="tools" id="tools-detailed" value="detailed">
+      <span><span class="label">Full detail</span><br><span class="desc">The same line the native chat shows — <code>Terminal("ls -la") (0.4s) ✓</code> — with the call's arguments and result available underneath.</span></span>
+    </label>
+    <label class="opt">
+      <input type="radio" name="tools" id="tools-compact" value="compact">
+      <span><span class="label">Just the name</span><br><span class="desc">One muted line per call, e.g. “✓ terminal”.</span></span>
+    </label>
+    <label class="opt">
+      <input type="radio" name="tools" id="tools-hidden" value="hidden">
+      <span><span class="label">Hide them</span><br><span class="desc">Leave tool calls out of the chat entirely; only what Hermes says shows.</span></span>
+    </label>
+    <div class="saved" id="tools-saved"></div>
   </fieldset>
 
   <fieldset>

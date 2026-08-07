@@ -26,6 +26,7 @@ const el = {
 };
 
 let notifyCfg = globalThis.HERMES.notifyConfig(null);  // per-surface toggles, loaded from settings
+let toolMode = globalThis.HERMES.toolDisplay(null);    // hidden | compact | detailed
 
 // Show/hide the "response waiting" pill note and the dropdown ring when another
 // session has an unread reply (each gated by its setting).
@@ -71,6 +72,13 @@ function paintRich(node, text, streaming) {
 function setStatus(kind, label) {
   el.status.className = `status status--${kind}`;
   el.status.textContent = label;
+}
+// The pill for a session we're attached to. "waiting for input" comes from the
+// gateway's own view of the session (session.active_list status) — a turn
+// blocked on a clarify/sudo/secret answer is not the same as one still working,
+// and calling it "working…" is what made a stalled session look alive.
+function setTurnStatus(busy, awaiting) {
+  setStatus("ok", awaiting ? "waiting for input" : busy ? "working…" : "connected");
 }
 function setContext(ctx, label) {
   attachedContext = ctx;
@@ -197,7 +205,7 @@ function connectGateway() {
 function onGatewayMessage(m) {
   reconnectTries = 0;          // the port is alive again
   switch (m.type) {
-    case "log":        renderLog(m.storedId, m.items, m.busy); break;
+    case "log":        renderLog(m.storedId, m.items, m.busy, m.awaiting); break;
     case "render":     if (m.storedId === viewingStoredId) applyRenderOp(m); break;
     case "activity":   onActivity(m); break;
     case "notify":     break; // OS notification is fired by the background
@@ -228,13 +236,122 @@ function renderItem(item) {
     if (item.streaming) { b.classList.add("streaming"); streamBubble = b; streamText = item.text || ""; }
     return b;
   }
-  if (item.kind === "tool") {
-    const b = addMsg("system", `${item.done ? "✓" : "⚙"} ${item.name || "tool"}`);
-    if (!item.done) lastToolBubble = b;
-    return b;
-  }
+  if (item.kind === "tool") return renderTool(item);
   if (item.kind === "request") return renderRequest(item);
   return addMsg("system", item.text || "");
+}
+
+// ── Tool / skill / terminal rows ───────────────────────────────────────────
+// Three modes, per Settings → Tool activity (see HERMES.toolDisplay):
+//   hidden   — skip the row entirely, leaving only what Hermes says
+//   compact  — "✓ terminal"
+//   detailed — the native chat's line, `Terminal("ls -la") (0.4s) ✓`, with the
+//              call's arguments and result folded underneath
+// The background buffers the full detail regardless, so switching modes is a
+// re-render of what's already in hand.
+
+// snake_case tool name → the native chat's Title Case label (ui-tui
+// lib/text.ts toolTrailLabel).
+function toolLabel(name) {
+  const n = String(name || "tool");
+  return n.split("_").filter(Boolean).map((p) => p[0].toUpperCase() + p.slice(1)).join(" ") || n;
+}
+// Matches the gateway's _fmt_tool_duration so a call reads the same in both UIs.
+function fmtDuration(sec) {
+  if (sec < 10) return `${sec.toFixed(1)}s`;
+  if (sec < 60) return `${Math.round(sec)}s`;
+  const total = Math.round(sec);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
+const compactLine = (item) => `${item.done ? (item.error ? "✗" : "✓") : "⚙"} ${item.name || "tool"}`;
+
+function renderTool(item) {
+  if (toolMode === "hidden") return null;
+  const node = toolMode === "compact"
+    ? addMsg("system", compactLine(item))
+    : el.log.appendChild(document.createElement("div"));
+  node.dataset.toolId = item.toolId || "";
+  if (toolMode !== "compact") { node.className = "msg msg--tool"; paintTool(node, item); }
+  el.log.scrollTop = el.log.scrollHeight;
+  if (!item.done) lastToolBubble = node;
+  return node;
+}
+
+function paintTool(node, item) {
+  // Repainting drops the DOM, so carry the disclosure state across an update —
+  // a running tool repaints on every progress event, and collapsing the block
+  // out from under someone reading it is worse than the stale frame.
+  const wasOpen = node.querySelector(".tool-more")?.open;
+  node.textContent = "";
+  node.classList.toggle("running", !item.done);
+  node.classList.toggle("failed", !!item.error);
+
+  const head = document.createElement("div");
+  head.className = "tool-head";
+  const mark = document.createElement("span");
+  mark.className = "tool-mark";
+  mark.textContent = item.done ? (item.error ? "✗" : "✓") : "⚙";
+  const call = document.createElement("span");
+  call.className = "tool-call";
+  call.textContent = item.context ? `${toolLabel(item.name)}("${item.context}")` : toolLabel(item.name);
+  head.appendChild(mark);
+  head.appendChild(call);
+  if (typeof item.durationS === "number") {
+    const dur = document.createElement("span");
+    dur.className = "tool-dur";
+    dur.textContent = fmtDuration(item.durationS);
+    head.appendChild(dur);
+  }
+  node.appendChild(head);
+
+  const note = item.error || item.summary;
+  if (note) {
+    const n = document.createElement("div");
+    n.className = "tool-note";
+    n.textContent = note;
+    node.appendChild(n);
+  }
+
+  const blocks = [["Args", item.argsText], ["Result", item.resultText], ["Diff", item.diff]].filter(([, v]) => v);
+  if (!blocks.length) return;
+  const more = document.createElement("details");
+  more.className = "tool-more";
+  more.open = !!wasOpen;
+  const sum = document.createElement("summary");
+  sum.textContent = blocks.map(([k]) => k.toLowerCase()).join(" · ");
+  more.appendChild(sum);
+  for (const [label, text] of blocks) {
+    const h = document.createElement("div");
+    h.className = "tool-block-h";
+    h.textContent = label;
+    const pre = document.createElement("pre");
+    pre.className = "tool-block";
+    pre.textContent = text;
+    more.appendChild(h);
+    more.appendChild(pre);
+  }
+  node.appendChild(more);
+}
+
+// Concurrent tool calls interleave, so prefer the id; fall back to the row we
+// opened last for payloads that carry none.
+function findToolBubble(item) {
+  if (item.toolId) {
+    const nodes = el.log.querySelectorAll("[data-tool-id]");
+    for (let i = nodes.length - 1; i >= 0; i--) if (nodes[i].dataset.toolId === item.toolId) return nodes[i];
+  }
+  return lastToolBubble;
+}
+
+function updateTool(item) {
+  if (toolMode === "hidden") return;
+  const node = findToolBubble(item);
+  if (!node) { requestRerender(); return; }   // buffer and view have diverged
+  if (toolMode === "compact") node.textContent = compactLine(item);
+  else paintTool(node, item);
+  if (item.done && lastToolBubble === node) lastToolBubble = null;
 }
 
 // Interactive approval / clarify / sudo / secret request card.
@@ -340,7 +457,7 @@ function respondRequest(item, label, extra) {
   });
 }
 
-function renderLog(storedId, items, busy) {
+function renderLog(storedId, items, busy, awaiting) {
   viewingStoredId = storedId;
   clearTimeout(paintTimer); paintTimer = null;
   streamBubble = null; streamText = ""; lastToolBubble = null;
@@ -350,7 +467,7 @@ function renderLog(storedId, items, busy) {
   const meta = sessionMeta.get(storedId); if (meta) { meta.unread = false; decorateOption(storedId); }
   updateUnreadIndicators();
   syncDropdownTo(storedId);
-  setStatus("ok", busy ? "working…" : "connected");
+  setTurnStatus(busy, awaiting);
   el.send.disabled = !!busy;
 }
 
@@ -404,8 +521,8 @@ function applyRenderOp(m) {
         el.log.scrollTop = el.log.scrollHeight;
       } else requestRerender();   // the completed reply would otherwise be dropped
       break;
-    case "toolDone":
-      if (lastToolBubble) { lastToolBubble.textContent = `✓ ${m.name || "tool"}`; lastToolBubble = null; }
+    case "toolUpdate":
+      updateTool(m.item);
       break;
   }
 }
@@ -413,7 +530,7 @@ function applyRenderOp(m) {
 function onActivity(m) {
   sessionMeta.set(m.storedId, { busy: m.busy, unread: m.unread });
   if (m.storedId === viewingStoredId) {
-    setStatus("ok", m.busy ? "working…" : "connected");
+    setTurnStatus(m.busy, m.awaiting);
     el.send.disabled = !!m.busy;
   }
   decorateOption(m.storedId);
@@ -665,6 +782,13 @@ browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes.settings) return;
   notifyCfg = globalThis.HERMES.notifyConfig(changes.settings.newValue);
   updateUnreadIndicators();   // reflect toggled indicators immediately
+  // Tool rows are drawn from the background's buffer, so a mode change only
+  // needs a repaint of the open transcript — no refetch, nothing lost.
+  const newToolMode = globalThis.HERMES.toolDisplay(changes.settings.newValue);
+  if (newToolMode !== toolMode) {
+    toolMode = newToolMode;
+    try { connectGateway().postMessage({ type: "rerender" }); } catch {}
+  }
   const newHost = changes.settings.newValue?.host || DEFAULT_HOST;
   if (newHost !== HOST) { HOST = newHost; reconnect(); }
 });
@@ -687,6 +811,7 @@ async function reconnect() {
   const { settings } = await browser.storage.local.get("settings");
   if (settings?.host) HOST = settings.host;   // point at the configured Hermes host
   notifyCfg = globalThis.HERMES.notifyConfig(settings);
+  toolMode = globalThis.HERMES.toolDisplay(settings);
 
   const { pendingTask } = await browser.storage.session.get("pendingTask");
   const handoff = await consumeHandoff();

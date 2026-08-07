@@ -143,6 +143,37 @@ body { display: flex; flex-direction: column; height: 100vh; }
   animation: blink 1s steps(2) infinite;
 }
 
+/* ── Tool / skill / terminal rows, "detailed" mode ────────────────────────
+   The native chat's trail line — Terminal("ls -la") (0.4s) ✓ — with the call's
+   args and result behind a disclosure so a long output can't bury the reply. */
+.msg--tool {
+  align-self: stretch; max-width: 100%; padding: 6px 10px;
+  font-size: 12px; color: var(--muted); white-space: normal;
+  background: color-mix(in srgb, var(--midground) 5%, transparent);
+  border: 1px solid var(--hairline); border-radius: 10px;
+}
+.msg--tool.running { border-color: var(--hairline-strong); }
+.msg--tool.failed  { border-color: color-mix(in srgb, #ff8f6b 45%, transparent); }
+
+.tool-head { display: flex; gap: 6px; align-items: baseline; }
+.tool-mark { flex: none; color: var(--midground); }
+.msg--tool.failed .tool-mark { color: #ff8f6b; }
+.tool-call { flex: 1; min-width: 0; color: var(--foreground); overflow-wrap: anywhere; }
+.tool-dur { flex: none; font-variant-numeric: tabular-nums; }
+
+.tool-note { margin-top: 3px; overflow-wrap: anywhere; }
+.msg--tool.failed .tool-note { color: #ff8f6b; }
+
+.tool-more { margin-top: 5px; }
+.tool-more > summary { cursor: pointer; color: var(--midground); }
+.tool-block-h { margin-top: 5px; font-weight: 600; color: var(--midground); }
+.tool-block {
+  margin: 2px 0 0; padding: 6px 8px; max-height: 260px; overflow: auto;
+  white-space: pre; color: var(--foreground);
+  background: #120a02; border: 1px solid var(--hairline); border-radius: 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; line-height: 1.5;
+}
+
 /* Interactive approval / clarify / sudo / secret request card */
 .msg--request {
   align-self: stretch; max-width: 100%;
