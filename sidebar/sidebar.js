@@ -746,6 +746,7 @@ function selectSession(storedId) {
 
 function newChat() {
   connectGateway().postMessage({ type: "new" });              // background creates + sends an empty log
+  el.input.focus();                                          // ready to type, no click needed
 }
 
 // ── Pop out / dock ──────────────────────────────────────────────────────────
