@@ -34,7 +34,20 @@
   </div>
 
   <form id="composer" class="composer">
-    <button type="button" id="attach" class="icon-btn" title="Attach current page context">＋page</button>
+    <button type="button" id="new-chat" class="icon-btn" title="Start a new chat" aria-label="Start a new chat">
+      <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true" focusable="false">
+        <path d="M7 2.25v9.5M2.25 7h9.5"/>
+      </svg>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <path d="M13.25 4.25v5a1.5 1.5 0 0 1-1.5 1.5H7.5l-2.75 2.5v-2.5h-.5a1.5 1.5 0 0 1-1.5-1.5v-5a1.5 1.5 0 0 1 1.5-1.5h7.5a1.5 1.5 0 0 1 1.5 1.5Z"/>
+      </svg>
+    </button>
+    <button type="button" id="attach" class="icon-btn" title="Attach current page context" aria-label="Attach current page context">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <path d="M9.5 1.75H4.25a1.5 1.5 0 0 0-1.5 1.5v9.5a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5V5.75Z"/>
+        <path d="M9.5 1.75v4h3.75"/>
+      </svg>
+    </button>
     <textarea id="input" class="input" rows="1" placeholder="Message Hermes…" autocomplete="off"></textarea>
     <button type="submit" id="send" class="send">Send</button>
   </form>

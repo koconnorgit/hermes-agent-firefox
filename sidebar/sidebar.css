@@ -219,7 +219,10 @@ body { display: flex; flex-direction: column; height: 100vh; }
 
 .composer { display: flex; gap: 6px; padding: 10px; border-top: 1px solid var(--hairline); align-items: flex-end; }
 .input {
-  flex: 1; resize: none; max-height: 140px; padding: 8px 10px;
+  /* min-width:0 so the textarea can shrink past its intrinsic (cols) width —
+     without it the composer's buttons push the row into overflow when the
+     sidebar is narrow. */
+  flex: 1; min-width: 0; resize: none; max-height: 140px; padding: 8px 10px;
   background: var(--panel); color: var(--foreground);
   border: 1px solid var(--hairline); border-radius: 10px; font: inherit;
 }
@@ -232,6 +235,10 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .send { background: var(--midground); color: #170d02; font-weight: 600; border-color: transparent; }
 .send:disabled { opacity: .5; cursor: default; }
 .icon-btn { font-size: 12px; color: var(--muted); white-space: nowrap; }
+/* The composer buttons are icon-only: centre the inline SVGs in the button box
+   and space the new-chat "+" from its bubble. */
+.composer .icon-btn { display: inline-flex; align-items: center; gap: 4px; line-height: 1; }
+.composer .icon-btn svg { display: block; }
 .icon-btn:disabled { opacity: .35; cursor: default; }
 
 /* Pin toggle: greyed out while the chat is unpinned, lit when it's pinned, so

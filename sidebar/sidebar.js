@@ -14,6 +14,7 @@ const el = {
   input: document.getElementById("input"),
   send: document.getElementById("send"),
   attach: document.getElementById("attach"),
+  newChat: document.getElementById("new-chat"),
   chip: document.getElementById("context-chip"),
   chipLabel: document.getElementById("context-label"),
   chipClear: document.getElementById("context-clear"),
@@ -882,6 +883,13 @@ el.input.addEventListener("input", () => {
   el.input.style.height = Math.min(el.input.scrollHeight, 140) + "px";
 });
 el.attach.addEventListener("click", attachActivePage);
+// Same path the picker's "＋ New chat" option takes: park the dropdown on that
+// option so the two stay in sync, then let the background make the session.
+el.newChat.addEventListener("click", () => {
+  el.sessionSelect.value = "";
+  updatePinButton();
+  newChat();
+});
 el.chipClear.addEventListener("click", () => setContext(null));
 el.sessionSelect.addEventListener("change", () => {
   const v = el.sessionSelect.value;
