@@ -25,6 +25,7 @@ const el = {
   popout: document.getElementById("popout"),
   settings: document.getElementById("settings"),
   waiting: document.getElementById("waiting"),
+  needsInput: document.getElementById("needs-input"),
 };
 
 let notifyCfg = globalThis.HERMES.notifyConfig(null);  // per-surface toggles, loaded from settings
@@ -36,6 +37,31 @@ function updateUnreadIndicators() {
   const anyUnread = [...sessionMeta.values()].some((m) => m.unread);
   el.waiting.hidden = !(anyUnread && notifyCfg.pill);
   el.sessionSelect.classList.toggle("has-unread", anyUnread && notifyCfg.dropdown);
+}
+
+// ── "another chat needs an answer" ─────────────────────────────────────────
+// A clarify/approval/sudo/secret card is part of ONE chat's transcript, and the
+// pane only renders the chat the background marks active — so a prompt raised
+// in any other chat would otherwise be invisible here, and an unanswered prompt
+// blocks the agent until the gateway gives up on it (~50 minutes). Name the
+// chat that's blocked and open it in one click; the card is already in its log
+// and renders with the rest of it, so nothing is drawn twice.
+function awaitingIds() {
+  return [...sessionMeta.entries()]
+    .filter(([id, m]) => m.awaiting && id !== viewingStoredId)
+    .map(([id]) => id);
+}
+function sessionTitle(id) {
+  const s = sessionList.find((x) => x.id === id);
+  return (s?.title || id).slice(0, 34);
+}
+function updateNeedsInput() {
+  const ids = awaitingIds();
+  el.needsInput.hidden = !ids.length;
+  el.needsInput.dataset.storedId = ids[0] || "";
+  if (!ids.length) return;
+  const more = ids.length > 1 ? ` (+${ids.length - 1} more)` : "";
+  el.needsInput.textContent = `❔ “${sessionTitle(ids[0])}” is waiting for your answer${more} — open it`;
 }
 
 // This same document runs in two places: the sidebar (default_panel) and a
@@ -460,7 +486,10 @@ function renderRequest(item) {
 
 function respondRequest(item, label, extra) {
   connectGateway().postMessage({
-    type: "respond", rtype: item.rtype, liveId: item.liveId, requestId: item.requestId, label, ...extra,
+    // storedId addresses the chat the card came from — which is not necessarily
+    // the active one, and outlives the live id a reconnect replaces.
+    type: "respond", rtype: item.rtype, storedId: item.storedId, liveId: item.liveId,
+    requestId: item.requestId, label, ...extra,
   });
 }
 
@@ -478,6 +507,7 @@ function renderLog(storedId, items, busy, awaiting) {
     scheduleReorder();          // read now, so it drops out of the unread group
   }
   updateUnreadIndicators();
+  updateNeedsInput();          // this chat's own card is on screen now, if it had one
   syncDropdownTo(storedId);
   setTurnStatus(busy, awaiting);
   el.send.disabled = !!busy;
@@ -541,7 +571,7 @@ function applyRenderOp(m) {
 
 function onActivity(m) {
   const was = groupOf(m.storedId);
-  sessionMeta.set(m.storedId, { busy: m.busy, unread: m.unread });
+  sessionMeta.set(m.storedId, { busy: m.busy, unread: m.unread, awaiting: m.awaiting });
   if (m.storedId === viewingStoredId) {
     setTurnStatus(m.busy, m.awaiting);
     el.send.disabled = !!m.busy;
@@ -551,6 +581,7 @@ function onActivity(m) {
   // recent groups — reorder so it doesn't stay buried down the list.
   if (groupOf(m.storedId) !== was) scheduleReorder();
   updateUnreadIndicators();
+  updateNeedsInput();
 }
 
 // The background's snapshot of every session it's tracking, sent when this view
@@ -558,11 +589,12 @@ function onActivity(m) {
 // while it was closed, so unread chats wouldn't sort or mark until the next event.
 function onSessionsState(m) {
   for (const s of m.sessions || []) {
-    sessionMeta.set(s.storedId, { busy: s.busy, unread: s.unread });
+    sessionMeta.set(s.storedId, { busy: s.busy, unread: s.unread, awaiting: s.awaiting });
     decorateOption(s.storedId);
   }
   scheduleReorder();
   updateUnreadIndicators();
+  updateNeedsInput();
 }
 
 // Fold any attached page context into the prompt text (prompt.submit takes text).
@@ -619,7 +651,10 @@ function decorateOption(storedId) {
   const opt = optionFor(storedId);
   if (!opt || !opt.dataset.base) return;
   const meta = sessionMeta.get(storedId);
-  const mark = (pinnedIds.has(storedId) ? "📌 " : "") + (meta?.unread ? "● " : meta?.busy ? "… " : "");
+  // ❔ outranks ● : a chat that's blocked on you is more urgent than one with a
+  // reply you haven't read, and it stays marked until you actually answer it.
+  const mark = (pinnedIds.has(storedId) ? "📌 " : "") +
+    (meta?.awaiting ? "❔ " : meta?.unread ? "● " : meta?.busy ? "… " : "");
   opt.textContent = mark + opt.dataset.base;
 }
 function syncDropdownTo(storedId) {
@@ -631,7 +666,8 @@ function syncDropdownTo(storedId) {
 // its predictable spot and just wears the ● marker.
 function groupOf(id) {
   if (pinnedIds.has(id)) return "pinned";
-  return sessionMeta.get(id)?.unread ? "unread" : "recent";
+  const meta = sessionMeta.get(id);
+  return (meta?.unread || meta?.awaiting) ? "unread" : "recent";
 }
 
 const GROUP_LABELS = { pinned: "Pinned", unread: "Unread", recent: "Recent" };
@@ -679,6 +715,7 @@ function renderSessionOptions() {
   const target = viewingStoredId && optionFor(viewingStoredId) ? viewingStoredId : current;
   el.sessionSelect.value = target || "";
   updatePinButton();
+  updateNeedsInput();   // titles just (re)loaded — name the blocked chat properly
 }
 
 // Re-grouping swaps options around, which slams a native select's popup shut
@@ -892,6 +929,13 @@ el.newChat.addEventListener("click", () => {
   newChat();
 });
 el.chipClear.addEventListener("click", () => setContext(null));
+// Jump to the chat that's blocked on an answer. Switching is all it takes: the
+// request card is already in that chat's buffered log, so it comes down with
+// the rest of the transcript (and the bar hides itself once we're there).
+el.needsInput.addEventListener("click", () => {
+  const id = el.needsInput.dataset.storedId;
+  if (id) selectSession(id);
+});
 el.sessionSelect.addEventListener("change", () => {
   const v = el.sessionSelect.value;
   updatePinButton();

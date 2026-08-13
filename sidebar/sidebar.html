@@ -26,6 +26,10 @@
     <button type="button" id="open-web" class="icon-btn" title="Open this chat in the Hermes dashboard">↗</button>
   </div>
 
+  <!-- A prompt raised in a chat you're not looking at: its card lives in that
+       chat's transcript, so this says which one and takes you there. -->
+  <button type="button" id="needs-input" class="needs-input" hidden></button>
+
   <main id="log" class="log" aria-live="polite"></main>
 
   <div id="context-chip" class="chip" hidden>

@@ -442,7 +442,7 @@ class Gateway {
       port.postMessage({
         type: "sessions-state",
         sessions: [...this.sessions.values()].map((s) => ({
-          storedId: s.storedId, busy: s.busy, unread: s.unread, awaiting: s.awaiting,
+          storedId: s.storedId, busy: s.busy, unread: s.unread, awaiting: this._awaiting(s),
         })),
       });
     } catch {}
@@ -693,7 +693,7 @@ class Gateway {
     // folds every tool row back up. The stall watchdog resyncs on a timer while
     // a long turn runs, so only repaint when the transcript actually moved.
     const changed = fresh !== before || s.log.length !== prevLen;
-    if (changed && this._isActive(s)) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: s.awaiting });
+    if (changed && this._isActive(s)) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: this._awaiting(s) });
     // We only learned about this reply by re-reading the transcript, so nothing
     // announced it — raise the badge/notification now rather than leaving the
     // turn silently finished.
@@ -756,6 +756,7 @@ class Gateway {
       // worth chasing).
       case "message.complete":
         this._endAssistant(s, txt(p.text) || txt(p.rendered));
+        this._expireRequests(s);   // the turn ended — any prompt still open timed out
         this._completed(s); this._setBusy(s, false); this._scheduleVerify(s);
         break;
       // tool.start's args are the server's redacted display copy
@@ -774,27 +775,35 @@ class Gateway {
       case "tool.progress": this._toolProgress(s, p.name || p.tool, plain(p.preview || "")); break;
       case "tool.complete": this._toolDone(s, p); break;
       case "error": this._push(s, { kind: "system", text: `⚠ ${txt(p.message) || txt(p.text) || "agent error"}` }); this._setBusy(s, false); break;
+      // Cards carry the STORED id as well as the live one. The live id is what
+      // the gateway wants back, but it's re-minted by every reconnect, and a
+      // prompt can sit unanswered for as long as it takes someone to notice it —
+      // so the stored id is what tells us which buffer the card belongs to.
       case "approval.request":
-        this._push(s, { kind: "request", rtype: "approval", liveId: ev.session_id, command: p.command || "", choices: (p.choices && p.choices.length) ? p.choices : ["once", "deny"], resolved: false });
+        this._push(s, { kind: "request", rtype: "approval", storedId: s.storedId, liveId: ev.session_id, command: p.command || "", choices: (p.choices && p.choices.length) ? p.choices : ["once", "deny"], resolved: false });
         this._needsInput(s); break;
       case "clarify.request":
-        this._push(s, { kind: "request", rtype: "clarify", liveId: ev.session_id, requestId: p.request_id, question: p.question || "", choices: (p.choices && p.choices.length) ? p.choices : null, multi: !!p.multi_select, resolved: false });
+        this._push(s, { kind: "request", rtype: "clarify", storedId: s.storedId, liveId: ev.session_id, requestId: p.request_id, question: p.question || "", choices: (p.choices && p.choices.length) ? p.choices : null, multi: !!p.multi_select, resolved: false });
         this._needsInput(s); break;
       // Keep request_id the way clarify does. The gateway files a pending
       // password/secret prompt under that id, and answering with the session
       // alone is what comes back as "no pending password request".
       case "sudo.request":
-        this._push(s, { kind: "request", rtype: "sudo", liveId: ev.session_id, requestId: p.request_id, question: p.prompt || p.message || "Password required", choices: null, resolved: false });
+        this._push(s, { kind: "request", rtype: "sudo", storedId: s.storedId, liveId: ev.session_id, requestId: p.request_id, question: p.prompt || p.message || "Password required", choices: null, resolved: false });
         this._needsInput(s); break;
       case "secret.request":
-        this._push(s, { kind: "request", rtype: "secret", liveId: ev.session_id, requestId: p.request_id, question: p.prompt || p.message || p.name || "Secret required", choices: null, resolved: false });
+        this._push(s, { kind: "request", rtype: "secret", storedId: s.storedId, liveId: ev.session_id, requestId: p.request_id, question: p.prompt || p.message || p.name || "Secret required", choices: null, resolved: false });
         this._needsInput(s); break;
     }
   }
 
   // Send the user's answer to a pending request, and mark it resolved in the log.
   async respond(m) {
-    const storedId = m.liveId ? this.liveToStored.get(m.liveId) : this.active;
+    // Answer the session the CARD belongs to, not whatever is on screen: a
+    // prompt raised in a background chat is answered from that chat, and its
+    // live id may have been re-minted by a reconnect since (the map is cleared
+    // on every socket loss), which used to leave the answer unattributed.
+    const storedId = m.storedId || (m.liveId ? this.liveToStored.get(m.liveId) : null) || this.active;
     const s = storedId ? this.sessions.get(storedId) : null;
     if (s) this._resolveRequest(s, m);
     // Address the session by the id it has NOW, not the one stamped on the card.
@@ -818,6 +827,36 @@ class Gateway {
         it.resolved = true; it.answer = m.label ?? "resolved"; break;
       }
     }
+    // The turn's busy flag never moved for this prompt, so nothing else would
+    // tell the views the chat has stopped waiting on the user.
+    this._activity(s);
+  }
+
+  // The newest request card still showing buttons, if any.
+  _pendingRequest(s) {
+    for (let i = s.log.length - 1; i >= 0; i--) {
+      const it = s.log[i];
+      if (it.kind === "request" && !it.resolved) return it;
+    }
+    return null;
+  }
+  // True when the agent can't move until the user answers. Derived rather than
+  // latched: s.awaiting comes from the gateway's own view of the session
+  // (session.active_list "waiting"), which it only reports for some prompt types
+  // and which _setBusy/_onSocketLost clear — while the card sits there
+  // unanswered either way. An unanswered card IS the session being blocked.
+  _awaiting(s) { return s.awaiting || !!this._pendingRequest(s); }
+  // The turn is over, so nothing is listening for these answers any more. Retire
+  // any card still showing buttons: otherwise the chat stays flagged as blocked
+  // forever and its buttons post answers into a request the gateway has dropped.
+  _expireRequests(s) {
+    let changed = false;
+    for (const it of s.log) {
+      if (it.kind === "request" && !it.resolved) { it.resolved = true; it.answer = "unanswered"; changed = true; }
+    }
+    if (!changed) return;
+    if (this._isActive(s)) this.rerender();   // repaint: those buttons are dead now
+    this._activity(s);                        // and this chat no longer needs input
   }
 
   _isActive(s) { return s.storedId === this.active; }
@@ -996,7 +1035,7 @@ class Gateway {
     // is how a long reply used to sit invisible until the user hit ⟳).
     if (s.unfinished) this._scheduleVerify(s, attempt + 1);
   }
-  _activity(s) { this.broadcast({ type: "activity", storedId: s.storedId, busy: s.busy, unread: s.unread, awaiting: s.awaiting }); }
+  _activity(s) { this.broadcast({ type: "activity", storedId: s.storedId, busy: s.busy, unread: s.unread, awaiting: this._awaiting(s) }); }
   // Alert when the reply isn't the session you're actively looking at — which
   // includes the case where NO view is open (ports empty), so a reply to the
   // last-viewed session still notifies.
@@ -1007,7 +1046,12 @@ class Gateway {
     this.updateBadge();
   }
   _needsInput(s) {   // the agent is blocked waiting for an answer
-    if (this._shouldAlert(s)) { s.unread = true; this._activity(s); this._notify(s, "Hermes needs your input."); }
+    if (this._shouldAlert(s)) { s.unread = true; this._notify(s, "Hermes needs your input."); }
+    // Always, active or not. The card itself only reaches the pane when this
+    // session is the one on screen (_emit), so for any other chat this is the
+    // ONLY signal that a prompt is sitting there — without it the notification
+    // points at a pane that shows nothing, and the request is never answered.
+    this._activity(s);
     this.updateBadge();
   }
   _notify(s, message = "New reply in another session.") {
@@ -1074,7 +1118,7 @@ class Gateway {
   // itself out of sync with the stream (see the sidebar's render ops).
   rerender() {
     const s = this.active ? this.sessions.get(this.active) : null;
-    if (s) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: s.awaiting });
+    if (s) this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: this._awaiting(s) });
   }
 
   _setActive(storedId) {
@@ -1088,13 +1132,13 @@ class Gateway {
     const s = await this.openSession(storedId);
     this._setActive(storedId);
     s.unread = false; this.updateBadge();
-    this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: s.awaiting });
+    this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: this._awaiting(s) });
     return s;
   }
   async viewNew() {
     const s = await this.newSession();
     this._setActive(s.storedId);
-    this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: s.awaiting });
+    this.broadcast({ type: "log", storedId: s.storedId, items: s.log, busy: s.busy, awaiting: this._awaiting(s) });
     return s;
   }
   async resumeActive() {
